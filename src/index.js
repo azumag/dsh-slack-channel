@@ -69,6 +69,13 @@ export function apply(ctx, config) {
    */
   let selfIds
 
+  /**
+   * This bot's own USER id (auth.test), the spelling a Slack mention uses.
+   * Telling "did they mention us?" and addressing the answer back both need
+   * it; undefined until the probe answers, like selfIds.
+   */
+  let selfUserId
+
   // Boot-time marker (dsh-a2a convention): the loader does not surface info
   // logs by default, so a direct stderr write confirms apply() ran.
   const channelSummary = config.allowAllChannels === true ? 'ALL' : (config.allowedChannelIds.length > 0 ? config.allowedChannelIds.join(',') : 'none')
@@ -100,14 +107,48 @@ export function apply(ctx, config) {
   }
 
   /**
+   * Whether the text mentions THIS bot, in the `<@U123>` spelling or the
+   * legacy `<@U123|name>` one. An unresolved self id yields false, so a
+   * failed probe can never make us answer a mention that was not ours.
+   */
+  function isSelfMention(text) {
+    if (selfUserId === undefined) return false
+    return text.includes('<@' + selfUserId + '>') || text.includes('<@' + selfUserId + '|')
+  }
+
+  /**
+   * The user to mention back when answering this message, or undefined.
+   * Anyone who mentions us is mentioned back — humans and other apps alike
+   * (an app's message carries its own bot_id AND its user id, which is the
+   * spelling a mention needs). Our own posts never reach here, and the
+   * self-id check keeps that true even if the filter above is relaxed.
+   * Commands are answered by notices, not by the agent, and get no mention.
+   *
+   * NOTE: two agents that mention each other can keep answering each other.
+   * A channel where every participant replies to every message already had
+   * that shape; the mention only makes the ping explicit. Add a rule here
+   * (cooldown, channel allowlist, first-reply-only) if that ever runs hot.
+   */
+  function mentionBackTarget(event, text) {
+    if (typeof event.user !== 'string' || event.user.length === 0) return undefined
+    if (selfIds !== undefined && selfIds.has(event.user)) return undefined
+    return isSelfMention(text) ? event.user : undefined
+  }
+
+  /**
    * Deliver one channel reply, splitting to the configured size cap and
    * converting to mrkdwn. Threaded when threadReplies and the originating
    * message's ts is known. A failed post is logged and dropped: one lost
-   * reply must never wedge the socket loop.
+   * reply must never wedge the socket loop. When the triggering message
+   * mentioned us, the FIRST chunk is prefixed with a mention of its author
+   * (after mrkdwn conversion, so the mention is not escaped as text).
    */
   async function sendReply(record, text) {
+    let first = true
     for (const raw of splitMessage(text, config.maxReplyChars)) {
-      const body = toSlackMrkdwn(raw)
+      const prefix = first === true && record.mentionUserId !== undefined ? '<@' + record.mentionUserId + '> ' : ''
+      first = false
+      const body = prefix + toSlackMrkdwn(raw)
       // Safety valve: escaping can grow a chunk past the intended cap.
       for (const piece of splitMessage(body, config.maxReplyChars + 64)) {
         try {
@@ -123,10 +164,12 @@ export function apply(ctx, config) {
   }
 
   /** Submit one channel message to the agent as a fresh follow-up turn. */
-  function startTurn(record, text, eventTs) {
+  function startTurn(record, text, eventTs, mentionUserId) {
     record.busy = true
     record.threadTs = eventTs
     record.eventTs = eventTs
+    /** The author to mention back in this turn's reply, when they used one. */
+    record.mentionUserId = mentionUserId
     record.collector ??= createTurnCollector()
     record.collector.clear()
     try {
@@ -141,7 +184,7 @@ export function apply(ctx, config) {
   async function drain(record) {
     if (record.busy || record.queue.length === 0) return
     const next = record.queue.shift()
-    startTurn(record, next.text, next.ts)
+    startTurn(record, next.text, next.ts, next.mentionUserId)
   }
 
   /** One turn ended: reduce collected texts to a reply and release the channel. */
@@ -162,6 +205,7 @@ export function apply(ctx, config) {
       void slack.unreact(record.chatId, record.eventTs, config.ackReaction)
     }
     record.eventTs = undefined
+    record.mentionUserId = undefined
     record.busy = false
     await drain(record)
   }
@@ -180,6 +224,7 @@ export function apply(ctx, config) {
         // as a failure so the strict filter stays in force.
         if (ids.length === 0) throw new Error('auth.test returned neither bot_id nor user_id')
         selfIds = new Set(ids)
+        selfUserId = typeof me.user_id === 'string' && me.user_id.length > 0 ? me.user_id : undefined
         logger.info('own identity resolved (bot_id=' + me.bot_id + ', user_id=' + me.user_id + '); messages from other apps are accepted')
         return
       } catch (error) {
@@ -300,11 +345,11 @@ export function apply(ctx, config) {
     }
 
     if (record.busy) {
-      record.queue.push({ text, ts: event.ts })
+      record.queue.push({ text, ts: event.ts, mentionUserId: mentionBackTarget(event, text) })
       if (config.ackQueued === false) return
       return sendReplyText(channel, event.ts, 'Queued (' + record.queue.length + ' pending).')
     }
-    startTurn(record, text, event.ts)
+    startTurn(record, text, event.ts, mentionBackTarget(event, text))
   }
 
   /** Post a control/notice message (commands, acks) into a thread. */

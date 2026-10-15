@@ -14,8 +14,12 @@ Pure `fetch` + the platform `WebSocket` — no npm dependencies, no build step, 
 | /new command | dispose the channel's agent, start a fresh session |
 | reaction ack | ⏳ reaction while the turn runs, removed when the reply lands |
 | errors | `agent/error` quoted back to the channel |
+| a message that mentions the bot | the reply opens with a mention of that message's author (`<@U123>`) |
+| a message from another app | served like any other message — one agent, several integrations in one channel |
 
-Sessions are created through `ctx.agents` (`inject: ['agents']`), so each channel gets a real DSH session with its own history, tools, and model route. The bot's own messages come back as events (`bot_id`) and edits/deletes carry a `subtype` — both are skipped, so the agent never reacts to itself.
+Sessions are created through `ctx.agents` (`inject: ['agents']`), so each channel gets a real DSH session with its own history, tools, and model route. `auth.test` identifies this bot once at startup: its own messages are skipped so the agent never reacts to itself, while messages from **other** apps (their own `bot_id`) are served. Every other `subtype` — edits, deletes, joins, thread broadcasts — is a trace and never drives the agent.
+
+Mention-back covers humans and apps alike: whoever wrote `<@our-id>` gets `<@their-id>` in front of the answer. Two agents that mention each other can therefore keep answering each other — see [Known limitations](#known-limitations).
 
 ## Requirements
 
@@ -222,6 +226,7 @@ There is also a live smoke test without an LLM: `node smoke.mjs` mounts the plug
 - **No slash-command integration** — commands are plain chat text ("/new"); Slack's interactivity/slash-command payloads are acked and ignored.
 - **One turn per channel at a time** — concurrent messages queue; they are not steering.
 - **Approval questions** are not surfaced on Slack; mount this plugin in a composition whose policy does not require interactive approval.
+- **Agents can ping each other** — every message that mentions the bot is answered with a mention of its author, and messages from other apps are served. In a channel where several agent apps all reply to each other, that can sustain a conversation between them. The plugin answers one turn per channel and only when a message arrives, so it is not a runaway loop by itself, but a channel like that is worth watching for cost. Gate it by only forwarding messages that mention the bot, or by skipping `bot_message` senders in `mentionBackTarget`. Also note that a channel where the bot is present is served *whether or not* the bot is mentioned (`allowAllChannels`, or a listed channel): mention-back is not mention-gating.
 
 ## Files
 

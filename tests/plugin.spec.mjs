@@ -195,6 +195,42 @@ test('own echoes are ignored while another app is served', async () => {
   }
 })
 
+test('a mention is answered with a mention of its author', async () => {
+  const mock = await startMockSlack()
+  mock.setHandler((method) => {
+    if (method === 'auth.test') return { reply: { ok: true, bot_id: 'B-SELF', user_id: 'U-BOT' } }
+    return undefined
+  })
+  try {
+    const h = await mountConnected(mock)
+    await waitFor(() => h.sockets.length > 0 && h.sockets[0].listeners.message?.length > 0)
+    await waitFor(() => mock.calls.some((c) => c.method === 'auth.test'))
+    await sleep(200) // let the probe store our user id
+
+    // No mention: answered plainly.
+    h.push(messageEvent('C42', 'plain question'))
+    await waitFor(() => h.sent().some((s) => s.text === 'pong'))
+
+    // Mentioned by a human: the answer opens with a mention of that human.
+    h.push(messageEvent('C42', '<@U-BOT> ping'))
+    await waitFor(() => h.sent().some((s) => s.text === '<@U1> pong'))
+
+    // Mentioned by another app: its user id is mentioned back too.
+    h.push(messageEvent('C42', '<@U-BOT> app ping', { bot_id: 'B-OTHER', user: 'U-APP' }))
+    await waitFor(() => h.sent().some((s) => s.text === '<@U-APP> pong'))
+
+    // Our own post never earns a mention back (it is filtered out entirely).
+    const sentAfterApp = h.sent().length
+    h.push(messageEvent('C42', '<@U-BOT> self ping', { bot_id: 'B-SELF', user: 'U-SELF' }))
+    await sleep(200)
+    equal(h.sent().length, sentAfterApp, 'own echo still ignored')
+
+    await h.dispose()
+  } finally {
+    await mock.close()
+  }
+})
+
 test('/id answers with the channel id; /help lists commands', async () => {
   const mock = await startMockSlack()
   try {
