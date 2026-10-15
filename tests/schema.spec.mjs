@@ -67,6 +67,15 @@ test('valid values pass through', () => {
   equal(value.pairToken, 'topsecret')
 })
 
+test('agentPreset accepts a name and rejects an empty one', () => {
+  const ok = validate({ agentPreset: 'standard' })
+  assert(ok.issues === undefined, 'no issues expected')
+  equal(ok.value.agentPreset, 'standard')
+
+  const blank = validate({ agentPreset: '   ' })
+  assert(blank.issues !== undefined && blank.issues.some((i) => i.message.includes('agentPreset')), 'agentPreset issue expected')
+})
+
 test('non-object config is rejected', () => {
   const { issues } = validate([1, 2])
   assert(issues !== undefined && issues.length > 0, 'issues expected')

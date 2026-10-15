@@ -37,6 +37,12 @@
         # Permission preset applied to freshly created sessions — the same
         # named table the web UI's preset switcher offers.
         # permissionPreset: workspace-write
+        # Agent preset mounted into each channel session (fresh and resumed) —
+        # the same composition table the web UI's preset switcher lists. The
+        # preset is what supplies bash/read/grep and the rest of its tools; an
+        # unset value leaves a channel session with the profile's own plugins
+        # only, so it cannot read repository files or run commands.
+        # agentPreset: standard
         # Channel authorization: deny by default, then allow specific ids.
         allowedChannelIds: []
         # allowAllChannels: true         # explicit escape hatch

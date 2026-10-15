@@ -53,7 +53,7 @@ function makeCtx() {
     },
     effect(fn, label) { effects.push(fn) },
     // The real cordis context resolves an unmounted service to undefined;
-    // sessions.js consults agentDefaultModel/permissionPresets through it.
+    // sessions.js consults agentDefaultModel/permissionPresets/agentPresets through it.
     get: () => undefined,
     agents: undefined,
     __listeners: listeners,

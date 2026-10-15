@@ -95,6 +95,14 @@ function validate(input) {
   cfg.permissionPreset = optionalString(src.permissionPreset)
   if (cfg.permissionPreset === null) issues.push({ message: 'permissionPreset must be a non-empty string' })
 
+  // Agent preset mounted into every channel session (fresh and resumed) — the
+  // same composition table the web UI's preset switcher lists (e.g. standard,
+  // minimal). The preset, not the profile, is what supplies bash/read/grep and
+  // the other preset tools, so an unset value leaves a channel session with
+  // profile-scoped tools only.
+  cfg.agentPreset = optionalString(src.agentPreset)
+  if (cfg.agentPreset === null) issues.push({ message: 'agentPreset must be a non-empty string' })
+
   // Per-channel workspace overrides: channel id → absolute workspace root.
   // Lets a Slack sidebar section (channels grouped per project) agree with
   // DSH: every channel in one section works in that section's workspace.

@@ -161,8 +161,8 @@ are client-side organization — Slack ships no bot API to create or read them �
 so the mapping is agreed on both ends: you group the channels in Slack, the
 config pins each channel's workspace here. Every channel remains one
 independent session (`/new` starts a fresh one) rooted in that workspace,
-carrying the same route, permission preset, and persistence as the web
-interface.
+carrying the same route, permission preset, agent preset, and persistence as
+the web interface.
 
 ## Full configuration reference
 
@@ -175,6 +175,7 @@ interface.
 | `cwd` | server cwd | Workspace root for created sessions (must be absolute). |
 | `channelCwd` | — | Per-channel workspace override: `{ "C…": "/abs/path" }`. Lets a Slack sidebar section (channels grouped per project) agree with DSH workspaces. |
 | `permissionPreset` | composition default | Named preset applied to each freshly created session — the same table the web UI's preset switcher offers (`workspace-write`, `danger-full-access`, …). Resumed sessions keep their existing knobs. |
+| `agentPreset` | composition default (no preset) | Agent preset mounted into each channel session — the same composition table the web UI's preset switcher lists (`standard`, `minimal`, …). The preset is what supplies `bash`/`read`/`grep` and the rest of that preset's tools, prompt sections and skills; without it a channel session sees only the plugins the profile mounts globally (its MCP servers, the workspace dependency tools) and honestly reports that it cannot read repository files or CI. Mounted on resume too, so a session created before the setting existed gains the tools on its next resume. |
 | `allowedChannelIds` | `[]` | Channel allowlist. Empty + `allowAllChannels: false` denies everything. |
 | `allowAllChannels` | `false` | Explicitly serve every channel the bot is in. |
 | `notifyUnauthorized` | `false` | Reply "not authorized" to rejected channels. |
@@ -229,13 +230,15 @@ A bot token is a **credential**: whoever can post into a served channel can driv
 4. Restrict the composition the channel mounts into — don't give the Slack-facing host approval-free shell access unless you accept the risk.
 5. For enrollment without config edits, set `pairToken` (+ `stateFile`) and `/pair <token>` from the target channel. Enrollment is additive; remove ids from `state.json` to revoke.
 
+`agentPreset` decides how much of that composition a channel session gets. Left unset, sessions inherit only the profile-scoped plugins (MCP servers, workspace dependency tools): the agent can read GitHub objects its token allows but cannot open repository files or run commands. Setting it to `standard` (or any preset whose children include `tool-bash`/`tool-fs`) hands the channel the same tool set the web UI has — including in-workspace writes and command execution. Approval questions still never reach Slack, so operations the sandbox would ask about (writing outside `cwd`, for example) fail closed rather than prompting anyone.
+
 ## Testing
 
 ```sh
 node tests/run.mjs
 ```
 
-52 tests, no network required: the suite drives the plugin's `apply` against a local mock Web API server and a scripted fake websocket — reply delivery (threaded), reaction acks, echo guard, queueing, /new, /stop, /pair enrollment persistence, unauthorized gating, teardown, Socket Mode ack/reconnect/abort behavior, config validation, mrkdwn escaping, chunk splitting, and the Web API client (error mapping, 429 Retry-After header).
+62 tests, no network required: the suite drives the plugin's `apply` against a local mock Web API server and a scripted fake websocket — reply delivery (threaded), reaction acks, echo guard, queueing, /new, /stop, /pair enrollment persistence, unauthorized gating, teardown, Socket Mode ack/reconnect/abort behavior, config validation, mrkdwn escaping, chunk splitting, and the Web API client (error mapping, 429 Retry-After header).
 
 There is also a live smoke test without an LLM: `node smoke.mjs` mounts the plugin with a stub echo agent against your real workspace (tokens from `.env.local`, gitignored) — post a message, get `echo: <text>` in-thread.
 

@@ -20,20 +20,47 @@ function makeAgents({ resumeFails = false } = {}) {
   const created = []
   const resumed = []
   const disposed = []
+  const setups = []
   let counter = 0
   return {
-    created, resumed, disposed,
+    created, resumed, disposed, setups,
     async create(options) {
       const id = options.sessionId ?? ('gen-' + (++counter))
+      if (options.setup !== undefined) {
+        const agentCtx = { scope: 'agent:' + id }
+        setups.push({ id, ctx: agentCtx })
+        await options.setup(agentCtx, { id, session: { id } })
+      }
       const agent = { id, session: { id, header: { id } }, options }
       created.push(agent)
       return { agent, dispose: async () => { disposed.push(id) } }
     },
     async resume(options) {
       if (resumeFails) throw new Error('persistence not configured')
-      const agent = { id: options.resumeSessionId, session: { id: options.resumeSessionId, header: { id: options.resumeSessionId } }, options }
+      const id = options.resumeSessionId
+      if (options.setup !== undefined) {
+        const agentCtx = { scope: 'agent:' + id }
+        setups.push({ id, ctx: agentCtx })
+        await options.setup(agentCtx, { id, session: { id } })
+      }
+      const agent = { id, session: { id, header: { id } }, options }
       resumed.push(agent)
-      return { agent, dispose: async () => { disposed.push(options.resumeSessionId) } }
+      return { agent, dispose: async () => { disposed.push(id) } }
+    },
+  }
+}
+
+/** Fake agentPresets service: records mounts, optionally fails resolve. */
+function makePresets({ failResolve = false } = {}) {
+  const mounts = []
+  return {
+    mounts,
+    async resolve(id) {
+      if (failResolve) throw new Error('unknown preset ' + id)
+      return { id }
+    },
+    async mount(agentCtx, id) {
+      mounts.push({ agentCtx, id })
     },
   }
 }
@@ -113,6 +140,69 @@ test('same chat returns the same record', async () => {
   const b = await sessions.get(3)
   equal(a, b)
   equal(agents.created.length, 1)
+})
+
+test('mounts the configured agent preset on a fresh session', async () => {
+  const agents = makeAgents()
+  const presets = makePresets()
+  const sessions = createChatSessions({
+    ctx: { agents, get: (name) => (name === 'agentPresets' ? presets : undefined) },
+    config: { cwd: '/tmp', agentPreset: 'standard' },
+    logger: makeLogger(),
+  })
+  await sessions.get(21)
+  equal(agents.created[0].options.meta, { cwd: '/tmp', agentPreset: 'standard' })
+  equal(presets.mounts.map((m) => m.id), ['standard'])
+  equal(agents.setups.length, 1)
+  equal(agents.setups[0].ctx, presets.mounts[0].agentCtx)
+})
+
+test('mounts the configured agent preset on resume too', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-tg-'))
+  const stateFile = join(dir, 'state.json')
+  const first = createChatSessions({ ctx: { agents: makeAgents(), get: () => undefined }, config: { cwd: '/tmp', stateFile }, logger: makeLogger() })
+  const original = await first.get(8)
+
+  const agents2 = makeAgents()
+  const presets = makePresets()
+  const second = createChatSessions({
+    ctx: { agents: agents2, get: (name) => (name === 'agentPresets' ? presets : undefined) },
+    config: { cwd: '/tmp', stateFile, agentPreset: 'standard' },
+    logger: makeLogger(),
+  })
+  const resumed = await second.get(8)
+  equal(resumed.agent.session.id, original.agent.session.id)
+  equal(agents2.resumed.length, 1)
+  equal(presets.mounts.map((m) => m.id), ['standard'])
+})
+
+test('an unmounted agentPresets service keeps the composition defaults', async () => {
+  const agents = makeAgents()
+  const logger = makeLogger()
+  const sessions = createChatSessions({
+    ctx: { agents, get: () => undefined },
+    config: { cwd: '/tmp', agentPreset: 'standard' },
+    logger,
+  })
+  await sessions.get(22)
+  equal(agents.created[0].options.meta, { cwd: '/tmp' })
+  equal(agents.created[0].options.setup, undefined)
+  assert(logger.lines.some((l) => l.includes('agentPresets')), 'warns about the unmounted registry')
+})
+
+test('an unresolvable agentPreset warns and still creates the session', async () => {
+  const agents = makeAgents()
+  const presets = makePresets({ failResolve: true })
+  const logger = makeLogger()
+  const sessions = createChatSessions({
+    ctx: { agents, get: (name) => (name === 'agentPresets' ? presets : undefined) },
+    config: { cwd: '/tmp', agentPreset: 'nope' },
+    logger,
+  })
+  await sessions.get(23)
+  equal(presets.mounts.length, 0)
+  equal(agents.created[0].options.meta, { cwd: '/tmp' })
+  assert(logger.lines.some((l) => l.includes('did not resolve')), 'warns about the unknown preset')
 })
 
 test('lookup routes by session id', async () => {

@@ -77,10 +77,46 @@ export function createChatSessions({ ctx, config, logger }) {
     }
   }
 
+  /**
+   * Resolve the configured Agent preset and the pre-publication setup that
+   * mounts it — the same composition step the Web session controller performs
+   * (`dsh-api-session-controller`'s composeAgent, via agentPresets.resolve +
+   * mount). The preset is what supplies the session's tool plugins, prompt
+   * sections and skills: without one a channel session sees only the plugins
+   * the profile mounts globally (its MCP servers, the workspace dependency
+   * tools), which is why a channel agent cannot read repository files or run
+   * `gh` unless a preset is mounted here. Optional config over an optional
+   * service: an unset preset, an unmounted registry, or a resolve failure
+   * keeps the composition defaults and only warns, so the channel still
+   * answers.
+   */
+  async function composeAgent() {
+    if (config.agentPreset === undefined) return {}
+    const presets = ctx.get('agentPresets')
+    if (presets === undefined) {
+      logger.warn('agentPreset configured but no agentPresets service is mounted; keeping composition defaults')
+      return {}
+    }
+    let resolvedId
+    try {
+      resolvedId = (await presets.resolve(config.agentPreset)).id
+    } catch (error) {
+      logger.warn('agentPreset ' + JSON.stringify(config.agentPreset) + ' did not resolve: ' + (error?.message ?? String(error)))
+      return {}
+    }
+    return {
+      agentPreset: resolvedId,
+      setup: async (agentCtx) => { await presets.mount(agentCtx, resolvedId) },
+    }
+  }
+
   async function create(chatId, resumeSessionId) {
     // Channel-scoped workspace first (the Slack-section ↔ DSH-workspace
     // mapping), then the plugin-wide workspace, then the server's cwd.
     const cwd = config.channelCwd?.[String(chatId)] ?? config.cwd ?? process.cwd()
+    // Composed once per create/resume so the resume and the fresh path mount
+    // the same preset revision.
+    const composition = await composeAgent()
     let handle
     let resumed = false
     if (resumeSessionId !== undefined) {
@@ -88,8 +124,15 @@ export function createChatSessions({ ctx, config, logger }) {
         // Resumed agents seed their first request route from their options
         // (a fresh loop instance has no logged header of its own), so the
         // resume MUST carry the same route fresh creates get — otherwise the
-        // persona's strict {{model}} reference fails the first message.
-        handle = await ctx.agents.resume({ resumeSessionId, agentOptions: agentOptions() })
+        // persona's strict {{model}} reference fails the first message. The
+        // setup callback mounts the preset again: a session created before the
+        // setting existed gains its tools on the next resume, matching how the
+        // Web controller re-mounts on resume.
+        handle = await ctx.agents.resume({
+          resumeSessionId,
+          agentOptions: agentOptions(),
+          ...(composition.setup === undefined ? {} : { setup: composition.setup }),
+        })
         resumed = true
       } catch (error) {
         if (String(error?.message ?? error).includes('while it is live')) {
@@ -105,8 +148,14 @@ export function createChatSessions({ ctx, config, logger }) {
     if (handle === undefined) {
       handle = await ctx.agents.create({
         sessionId: randomUUID(),
-        meta: { cwd },
+        meta: {
+          cwd,
+          // Recorded in the session header so a later reader (Web UI adoption,
+          // transcript readers) sees which preset composed this session.
+          ...(composition.agentPreset === undefined ? {} : { agentPreset: composition.agentPreset }),
+        },
         agentOptions: agentOptions(),
+        ...(composition.setup === undefined ? {} : { setup: composition.setup }),
       })
       applyPermissionPreset(handle)
     }
