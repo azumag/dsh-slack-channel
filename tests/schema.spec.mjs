@@ -20,8 +20,22 @@ test('defaults apply to an empty config', () => {
   equal(value.threadReplies, true)
   equal(value.ackReaction, 'hourglass')
   equal(value.notifyUnauthorized, false)
+  equal(value.mentionOnly, false)
+  equal(value.contextMessages, 20)
   equal(value.botToken, undefined)
   equal(value.appToken, undefined)
+})
+
+test('mentionOnly and contextMessages accept values within bounds', () => {
+  const ok = validate({ mentionOnly: true, contextMessages: 0 })
+  assert(ok.issues === undefined, 'contextMessages 0 disables the buffer')
+  equal(ok.value.mentionOnly, true)
+  equal(ok.value.contextMessages, 0)
+
+  const tooBig = validate({ contextMessages: 201 })
+  assert(tooBig.issues !== undefined, 'contextMessages above the cap is rejected')
+  const negative = validate({ contextMessages: -1 })
+  assert(negative.issues !== undefined, 'a negative contextMessages is rejected')
 })
 
 test('valid values pass through', () => {

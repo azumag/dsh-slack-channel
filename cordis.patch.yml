@@ -51,3 +51,7 @@
         # threadReplies: true      # reply in-thread on the originating message
         # maxReplyChars: 4000      # split longer replies into chunks
         # ackReaction: hourglass   # "working" emoji; '' disables
+        # mentionOnly: false       # serve only messages that address the bot
+        #                          # (DMs are never gated); gated messages are
+        #                          # kept and handed to the next addressed turn
+        # contextMessages: 20      # how many unseen messages that turn carries

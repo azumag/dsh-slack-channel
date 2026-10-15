@@ -231,6 +231,66 @@ test('a mention is answered with a mention of its author', async () => {
   }
 })
 
+test('mentionOnly serves only mentions, carrying the unseen messages', async () => {
+  const mock = await startMockSlack()
+  mock.setHandler((method) => {
+    if (method === 'auth.test') return { reply: { ok: true, bot_id: 'B-SELF', user_id: 'U-BOT' } }
+    return undefined
+  })
+  try {
+    const h = await mountConnected(mock, { mentionOnly: true, contextMessages: 5 })
+    await waitFor(() => h.sockets.length > 0 && h.sockets[0].listeners.message?.length > 0)
+    await waitFor(() => mock.calls.some((c) => c.method === 'auth.test'))
+    await sleep(200)
+
+    // Not addressed to us: no turn and no reply ...
+    h.push(messageEvent('C42', 'inner monologue'))
+    h.push(messageEvent('C42', 'more chatter', { user: 'U2' }))
+    await sleep(200)
+    equal(h.created.length, 0, 'gated messages drive no turn')
+    equal(h.sent().length, 0, 'gated messages get no reply')
+
+    // ... but addressed to us, they arrive as context ahead of the mention.
+    h.push(messageEvent('C42', '<@U-BOT> what do you think?'))
+    await waitFor(() => h.created.length === 1)
+    const first = h.created[0].followups[0].content[0].text
+    assert(first.startsWith('[channel context'), 'the context block comes first')
+    assert(first.includes('inner monologue'), 'context carries the first unseen message')
+    assert(first.includes('more chatter'), 'context carries the second unseen message')
+    assert(first.endsWith('<@U-BOT> what do you think?'), 'the mention stays at the end')
+
+    // The buffer is consumed once: the next mention carries no context.
+    await waitFor(() => h.sent().some((s) => s.text === '<@U1> pong'))
+    h.push(messageEvent('C42', '<@U-BOT> and now?'))
+    await waitFor(() => h.created[0].followups.length === 2)
+    equal(h.created[0].followups[1].content[0].text, '<@U-BOT> and now?', 'context is consumed once')
+
+    await h.dispose()
+  } finally {
+    await mock.close()
+  }
+})
+
+test('mentionOnly never gates a DM', async () => {
+  const mock = await startMockSlack()
+  mock.setHandler((method) => {
+    if (method === 'auth.test') return { reply: { ok: true, bot_id: 'B-SELF', user_id: 'U-BOT' } }
+    return undefined
+  })
+  try {
+    const h = await mountConnected(mock, { mentionOnly: true, allowAllChannels: true })
+    await waitFor(() => h.sockets.length > 0 && h.sockets[0].listeners.message?.length > 0)
+
+    h.push(messageEvent('D42', 'no mention in a direct message'))
+    await waitFor(() => h.created.length === 1)
+    equal(h.created.length, 1, 'a DM drives a turn without a mention')
+
+    await h.dispose()
+  } finally {
+    await mock.close()
+  }
+})
+
 test('/id answers with the channel id; /help lists commands', async () => {
   const mock = await startMockSlack()
   try {

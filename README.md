@@ -184,8 +184,28 @@ interface.
 | `maxReplyChars` | `4000` | Split longer replies at line boundaries. |
 | `threadReplies` | `true` | Reply in-thread on the originating message. |
 | `ackReaction` | `hourglass` | Emoji reaction marking the message being worked on (empty string disables). |
+| `mentionOnly` | `false` | Serve only messages that address the bot (or one of its commands). DMs are never gated. Messages that are gated become context, not silence — see below. |
+| `contextMessages` | `20` | How many unseen messages a mention-driven turn carries as context (`0` disables the buffer, `200` is the cap). |
 | `retryDelayMs` | `3000` | Backoff after Web API failures. |
 | `socketRetryDelayMs` | `2000` | Backoff between Socket Mode reconnects. |
+
+### Mention gating and context
+
+`mentionOnly: true` is the setting for a channel where several people (or several agents) talk and only some messages are meant for this bot. A message that does not address the bot drives no turn at all: no session is created, no reply is posted, no reaction is added. DMs are exempt — a message in a DM is always addressed to the bot.
+
+Gated messages are not discarded. They are remembered per channel (the last `contextMessages` of them) and prepended to the next turn that *does* address the bot:
+
+```
+[channel context — 3 message(s) posted since your last reply, oldest first]
+<@U0C7AN52QGN>: #2267 is closed, evidence attached
+<@U123>: thanks — can you double-check it?
+<@U0A1B2C3D4>: +1
+[end of channel context]
+
+<@U123> what do you think?
+```
+
+The block is consumed by that turn, so each unseen message is carried exactly once; the session then holds it as ordinary history. Attribution is the raw mention spelling (`<@U…>`), which the agent can also use to address someone in its reply. Messages longer than 1500 characters are truncated inside the block, and a composition that gates nothing never allocates the buffer at all.
 
 ## Troubleshooting
 

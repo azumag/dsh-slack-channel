@@ -136,6 +136,61 @@ export function apply(ctx, config) {
   }
 
   /**
+   * Messages the agent has NOT seen, per channel, oldest first. With
+   * mentionOnly on, a message that does not address the bot drives no turn —
+   * but it is kept here and attached to the next turn that does, so the
+   * agent still knows what the channel has been saying. A composition that
+   * gates nothing buffers nothing, so this costs no memory by default.
+   */
+  const unseenByChannel = new Map()
+
+  /** How many channels keep a buffer (memory bound). */
+  const UNSEEN_CHANNELS_MAX = 50
+
+  /** Per-message character cap inside a context block (prompt bound). */
+  const UNSEEN_TEXT_MAX = 1500
+
+  /** How one buffered message is attributed in the context block. */
+  function speakerLabel(event) {
+    if (typeof event.user === 'string' && event.user.length > 0) return '<@' + event.user + '>'
+    if (typeof event.bot_id === 'string' && event.bot_id.length > 0) return 'app:' + event.bot_id
+    return 'someone'
+  }
+
+  /** Remember one gated message as context, honouring both caps. */
+  function rememberUnseen(channel, event, text) {
+    if (config.contextMessages === 0) return
+    const buffer = unseenByChannel.get(channel) ?? []
+    const body = text.length > UNSEEN_TEXT_MAX ? text.slice(0, UNSEEN_TEXT_MAX) + '…' : text
+    buffer.push({ who: speakerLabel(event), text: body })
+    if (buffer.length > config.contextMessages) buffer.splice(0, buffer.length - config.contextMessages)
+    // Re-insert so the map's order is least-recently-used last.
+    unseenByChannel.delete(channel)
+    unseenByChannel.set(channel, buffer)
+    while (unseenByChannel.size > UNSEEN_CHANNELS_MAX) {
+      const oldest = unseenByChannel.keys().next().value
+      if (oldest === undefined) break
+      unseenByChannel.delete(oldest)
+    }
+  }
+
+  /**
+   * The context block for a turn that addresses the bot — the buffered
+   * messages, consumed here so each one is carried exactly once. Undefined
+   * when there is nothing to add.
+   */
+  function takeUnseenContext(channel) {
+    const buffer = unseenByChannel.get(channel)
+    unseenByChannel.delete(channel)
+    if (buffer === undefined || buffer.length === 0) return undefined
+    return [
+      '[channel context — ' + buffer.length + ' message(s) posted since your last reply, oldest first]',
+      ...buffer.map((message) => message.who + ': ' + message.text),
+      '[end of channel context]',
+    ].join('\n')
+  }
+
+  /**
    * Deliver one channel reply, splitting to the configured size cap and
    * converting to mrkdwn. Threaded when threadReplies and the originating
    * message's ts is known. A failed post is logged and dropped: one lost
@@ -327,6 +382,15 @@ export function apply(ctx, config) {
       return sendReplyText(channel, event.ts, 'Stop requested.')
     }
 
+    // Mention gating: with mentionOnly on, a channel message that does not
+    // address the bot drives no turn — it is remembered instead, to be handed
+    // to the next message that does. DMs are always addressed to the bot and
+    // are never gated (a DM that required a mention would be unusable).
+    if (config.mentionOnly === true && isSelfMention(text) === false && channel.startsWith('D') === false) {
+      rememberUnseen(channel, event, text)
+      return
+    }
+
     let record
     try {
       record = await sessions.get(channel)
@@ -344,12 +408,17 @@ export function apply(ctx, config) {
       void slack.react(channel, event.ts, config.ackReaction)
     }
 
+    // A mention-driven turn opens with the messages the agent has not seen,
+    // so answering "what do you think?" still knows what was discussed.
+    const unseen = isSelfMention(text) ? takeUnseenContext(channel) : undefined
+    const prompt = unseen === undefined ? text : unseen + '\n\n' + text
+
     if (record.busy) {
-      record.queue.push({ text, ts: event.ts, mentionUserId: mentionBackTarget(event, text) })
+      record.queue.push({ text: prompt, ts: event.ts, mentionUserId: mentionBackTarget(event, text) })
       if (config.ackQueued === false) return
       return sendReplyText(channel, event.ts, 'Queued (' + record.queue.length + ' pending).')
     }
-    startTurn(record, text, event.ts, mentionBackTarget(event, text))
+    startTurn(record, prompt, event.ts, mentionBackTarget(event, text))
   }
 
   /** Post a control/notice message (commands, acks) into a thread. */

@@ -9,6 +9,9 @@ import { isAbsolute } from 'node:path'
 
 const REPLY_MODES = ['last', 'all']
 
+/** Hard cap on the context block, whatever the config asks for. */
+const CONTEXT_MESSAGES_MAX = 200
+
 const DEFAULTS = Object.freeze({
   apiBase: 'https://slack.com/api',
   allowedChannelIds: [],
@@ -20,6 +23,8 @@ const DEFAULTS = Object.freeze({
   threadReplies: true,
   ackReaction: 'hourglass',
   notifyUnauthorized: false,
+  mentionOnly: false,
+  contextMessages: 20,
 })
 
 function isPlainObject(value) {
@@ -155,6 +160,18 @@ function validate(input) {
   // UX toggles.
   cfg.threadReplies = src.threadReplies === undefined ? DEFAULTS.threadReplies : !!src.threadReplies
   cfg.ackReaction = optionalString(src.ackReaction) ?? DEFAULTS.ackReaction
+
+  // Mention gating: when true a channel message drives a turn only if it
+  // addresses the bot (or is one of our commands). DMs are always addressed
+  // to the bot and are never gated. Messages that are gated are remembered
+  // and attached to the next turn that does address the bot, so the agent
+  // still sees the conversation it was not asked to answer.
+  cfg.mentionOnly = src.mentionOnly === undefined ? DEFAULTS.mentionOnly : !!src.mentionOnly
+  cfg.contextMessages = nonNegativeNumber(src.contextMessages, DEFAULTS.contextMessages)
+  if (cfg.contextMessages === undefined || cfg.contextMessages > CONTEXT_MESSAGES_MAX) {
+    issues.push({ message: 'contextMessages must be a number in [0, ' + CONTEXT_MESSAGES_MAX + ']' })
+    cfg.contextMessages = DEFAULTS.contextMessages
+  }
 
   // Optional channel→session persistence so restarts resume conversations,
   // and the state file carries /pair enrollments.
