@@ -86,6 +86,15 @@ export class SlackClient {
   }
 
   /**
+   * Identify the installed bot: `{ bot_id, user_id, team_id, … }`.
+   * The event filter needs our own ids to drop OUR messages while letting
+   * other apps' messages (which carry their own bot_id) through.
+   */
+  authTest(signal) {
+    return this.call('auth.test', this.#botToken, {}, { signal })
+  }
+
+  /**
    * Post one channel message. Slack messages are mrkdwn; the caller passes
    * already-converted text.
    * @param channelId - target channel (C…/G…/D…).

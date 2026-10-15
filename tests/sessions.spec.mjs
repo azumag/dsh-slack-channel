@@ -41,7 +41,7 @@ function makeAgents({ resumeFails = false } = {}) {
 test('creates a fresh session per chat', async () => {
   const agents = makeAgents()
   const logger = makeLogger()
-  const sessions = createChatSessions({ ctx: { agents }, config: { cwd: '/tmp' }, logger })
+  const sessions = createChatSessions({ ctx: { agents, get: () => undefined }, config: { cwd: '/tmp' }, logger })
   const record = await sessions.get(42)
   equal(agents.created.length, 1)
   equal(record.agent.id, agents.created[0].id)
@@ -51,7 +51,7 @@ test('creates a fresh session per chat', async () => {
 
 test('passes provider and model agent options', async () => {
   const agents = makeAgents()
-  const sessions = createChatSessions({ ctx: { agents }, config: { cwd: '/tmp', provider: 'p1', model: 'm1' }, logger: makeLogger() })
+  const sessions = createChatSessions({ ctx: { agents, get: () => undefined }, config: { cwd: '/tmp', provider: 'p1', model: 'm1' }, logger: makeLogger() })
   await sessions.get(1)
   equal(agents.created[0].options.agentOptions, { provider: 'p1', model: 'm1' })
   equal(agents.created[0].options.meta, { cwd: '/tmp' })
@@ -60,14 +60,14 @@ test('passes provider and model agent options', async () => {
 test('resume is attempted from state and can fail gracefully', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-tg-'))
   const stateFile = join(dir, 'state.json')
-  const first = createChatSessions({ ctx: { agents: makeAgents() }, config: { cwd: '/tmp', stateFile }, logger: makeLogger() })
+  const first = createChatSessions({ ctx: { agents: makeAgents(), get: () => undefined }, config: { cwd: '/tmp', stateFile }, logger: makeLogger() })
   const original = await first.get(7)
   assert(existsSync(stateFile), 'state file written')
   const saved = JSON.parse(readFileSync(stateFile, 'utf8'))
   equal(saved.chats['7'].sessionId, original.agent.session.id)
 
   const agents2 = makeAgents()
-  const second = createChatSessions({ ctx: { agents: agents2 }, config: { cwd: '/tmp', stateFile }, logger: makeLogger() })
+  const second = createChatSessions({ ctx: { agents: agents2, get: () => undefined }, config: { cwd: '/tmp', stateFile }, logger: makeLogger() })
   const resumed = await second.get(7)
   equal(agents2.resumed.length, 1)
   equal(resumed.agent.session.id, original.agent.session.id)
@@ -77,10 +77,10 @@ test('resume is attempted from state and can fail gracefully', async () => {
 test('resume failure falls back to a fresh session', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-tg-'))
   const stateFile = join(dir, 'state.json')
-  const first = createChatSessions({ ctx: { agents: makeAgents() }, config: { cwd: '/tmp', stateFile }, logger: makeLogger() })
+  const first = createChatSessions({ ctx: { agents: makeAgents(), get: () => undefined }, config: { cwd: '/tmp', stateFile }, logger: makeLogger() })
   await first.get(9)
   const agents2 = makeAgents({ resumeFails: true })
-  const second = createChatSessions({ ctx: { agents: agents2 }, config: { cwd: '/tmp', stateFile }, logger: makeLogger() })
+  const second = createChatSessions({ ctx: { agents: agents2, get: () => undefined }, config: { cwd: '/tmp', stateFile }, logger: makeLogger() })
   const record = await second.get(9)
   equal(record.resumed, false)
   equal(agents2.created.length, 1)
@@ -89,7 +89,7 @@ test('resume failure falls back to a fresh session', async () => {
 
 test('/new-style fresh get disposes the previous session', async () => {
   const agents = makeAgents()
-  const sessions = createChatSessions({ ctx: { agents }, config: { cwd: '/tmp' }, logger: makeLogger() })
+  const sessions = createChatSessions({ ctx: { agents, get: () => undefined }, config: { cwd: '/tmp' }, logger: makeLogger() })
   const first = await sessions.get(5)
   const second = await sessions.get(5, { fresh: true })
   equal(agents.disposed, [first.agent.session.id])
@@ -98,7 +98,7 @@ test('/new-style fresh get disposes the previous session', async () => {
 
 test('disposeAll disposes every chat session', async () => {
   const agents = makeAgents()
-  const sessions = createChatSessions({ ctx: { agents }, config: { cwd: '/tmp' }, logger: makeLogger() })
+  const sessions = createChatSessions({ ctx: { agents, get: () => undefined }, config: { cwd: '/tmp' }, logger: makeLogger() })
   const a = await sessions.get(1)
   const b = await sessions.get(2)
   await sessions.disposeAll()
@@ -108,7 +108,7 @@ test('disposeAll disposes every chat session', async () => {
 
 test('same chat returns the same record', async () => {
   const agents = makeAgents()
-  const sessions = createChatSessions({ ctx: { agents }, config: { cwd: '/tmp' }, logger: makeLogger() })
+  const sessions = createChatSessions({ ctx: { agents, get: () => undefined }, config: { cwd: '/tmp' }, logger: makeLogger() })
   const a = await sessions.get(3)
   const b = await sessions.get(3)
   equal(a, b)
@@ -117,7 +117,7 @@ test('same chat returns the same record', async () => {
 
 test('lookup routes by session id', async () => {
   const agents = makeAgents()
-  const sessions = createChatSessions({ ctx: { agents }, config: { cwd: '/tmp' }, logger: makeLogger() })
+  const sessions = createChatSessions({ ctx: { agents, get: () => undefined }, config: { cwd: '/tmp' }, logger: makeLogger() })
   const record = await sessions.get(11)
   equal(sessions.lookup(record.agent.session.id), record)
   equal(sessions.lookup('nope'), undefined)

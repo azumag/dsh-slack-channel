@@ -52,6 +52,9 @@ function makeCtx() {
       }
     },
     effect(fn, label) { effects.push(fn) },
+    // The real cordis context resolves an unmounted service to undefined;
+    // sessions.js consults agentDefaultModel/permissionPresets through it.
+    get: () => undefined,
     agents: undefined,
     __listeners: listeners,
   }
@@ -163,6 +166,35 @@ test('bot echoes and subtypes are ignored', async () => {
   }
 })
 
+test('own echoes are ignored while another app is served', async () => {
+  const mock = await startMockSlack()
+  // auth.test is what tells our own messages apart from another app's.
+  mock.setHandler((method) => {
+    if (method === 'auth.test') return { reply: { ok: true, bot_id: 'B-SELF', user_id: 'U-SELF' } }
+    return undefined
+  })
+  try {
+    const h = await mountConnected(mock)
+    await waitFor(() => h.sockets.length > 0 && h.sockets[0].listeners.message?.length > 0)
+    await waitFor(() => mock.calls.some((c) => c.method === 'auth.test'))
+    await sleep(200) // let the probe store the identity
+
+    // Our own post comes back as an event and must not drive the agent.
+    h.push(messageEvent('C42', 'our own reply', { bot_id: 'B-SELF' }))
+    await sleep(200)
+    equal(h.created.length, 0, 'own echo ignored')
+
+    // Another app's post is served.
+    h.push(messageEvent('C42', 'from another app', { bot_id: 'B-OTHER', subtype: 'bot_message' }))
+    await waitFor(() => h.created.length === 1)
+    equal(h.created.length, 1, 'another app creates a session')
+    await waitFor(() => h.sent().some((s) => s.text === 'pong'))
+    await h.dispose()
+  } finally {
+    await mock.close()
+  }
+})
+
 test('/id answers with the channel id; /help lists commands', async () => {
   const mock = await startMockSlack()
   try {
@@ -173,7 +205,7 @@ test('/id answers with the channel id; /help lists commands', async () => {
     equal(idReply.text, 'C42')
     h.push(messageEvent('C42', '/help'))
     await waitFor(() => h.sent().length >= 2)
-    assert(h.sent()[1].text.includes('/pair'), 'help mentions pairing')
+    assert(h.sent()[1].text.includes('!pair'), 'help mentions pairing')
     equal(h.created.length, 0, 'commands create no session')
     await h.dispose()
   } finally {

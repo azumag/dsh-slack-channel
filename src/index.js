@@ -61,6 +61,14 @@ export function apply(ctx, config) {
   const warnedChannels = new Set()
   const abort = new AbortController()
 
+  /**
+   * Identities of THIS bot (auth.test's bot_id and user_id). Other
+   * integrations post with their own bot_id, so the self-echo guard needs
+   * ours to tell "another app" from "our own reply". Stays undefined until
+   * the probe answers, and undefined keeps the strict filter.
+   */
+  let selfIds
+
   // Boot-time marker (dsh-a2a convention): the loader does not surface info
   // logs by default, so a direct stderr write confirms apply() ran.
   const channelSummary = config.allowAllChannels === true ? 'ALL' : (config.allowedChannelIds.length > 0 ? config.allowedChannelIds.join(',') : 'none')
@@ -158,6 +166,33 @@ export function apply(ctx, config) {
     await drain(record)
   }
 
+  // Resolve this bot's own identity once, so the event filter can drop only
+  // OUR messages and let other apps' posts through. Until it resolves every
+  // bot message is dropped — the pre-existing strict behaviour — so a failed
+  // probe can never let the agent answer itself.
+  const identityProbe = (async () => {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        const me = await slack.authTest(abort.signal)
+        const ids = [me.bot_id, me.user_id].filter((id) => typeof id === 'string' && id.length > 0)
+        // An answer without ids would yield an EMPTY identity set, which would
+        // let every bot message through — including our own echoes. Treat it
+        // as a failure so the strict filter stays in force.
+        if (ids.length === 0) throw new Error('auth.test returned neither bot_id nor user_id')
+        selfIds = new Set(ids)
+        logger.info('own identity resolved (bot_id=' + me.bot_id + ', user_id=' + me.user_id + '); messages from other apps are accepted')
+        return
+      } catch (error) {
+        if (abort.signal.aborted) return
+        if (attempt >= 5) {
+          logger.warn('auth.test failed, keeping the strict bot-message filter: ' + errorText(error))
+          return
+        }
+        await sleep(attempt * 1000, abort.signal)
+      }
+    }
+  })()
+
   // Reply path: committed assistant text of owned, busy sessions accumulates
   // per turn; the matching turn/end settles and releases the channel. Raw
   // chunks, reasoning, tool traffic, and titles stay off the wire.
@@ -187,13 +222,22 @@ export function apply(ctx, config) {
   /**
    * Handle one Slack message event. Only `message` events are accepted —
    * the manifest should not subscribe `app_mention` (Slack would deliver
-   * both and double-drive the agent). The bot's own messages carry bot_id
-   * and edit/delete traces carry subtype; both are skipped so the agent
-   * never reacts to itself.
+   * both and double-drive the agent). Messages from OTHER apps are processed
+   * (they carry their own bot_id); OUR OWN messages — bot_id, or the bot
+   * user id for app-user posts — and edit/delete/join traces are skipped so
+   * the agent never reacts to itself. Until auth.test resolves our ids every
+   * bot message is skipped, the strict fallback.
    */
   async function handleEvent(event) {
     if (event?.type !== 'message') return
-    if (event.bot_id !== undefined || event.subtype !== undefined) return
+    // `bot_message` is how another app posts; any other subtype is a trace
+    // (message_changed, message_deleted, channel_join, thread_broadcast, …)
+    // and must not drive the agent.
+    if (event.subtype !== undefined && event.subtype !== 'bot_message') return
+    // Our own posts come back as events; skipping exactly those is what keeps
+    // the agent from answering itself.
+    if (event.bot_id !== undefined && (selfIds === undefined || selfIds.has(event.bot_id))) return
+    if (event.user !== undefined && selfIds !== undefined && selfIds.has(event.user)) return
     const channel = event.channel
     if (channel === undefined) return
     const text = (event.text ?? '').trim()
@@ -203,8 +247,9 @@ export function apply(ctx, config) {
     // Pairing is the one command an unauthorized channel may use: an
     // operator secret enrolls the channel without a host restart. A wrong
     // token falls through to the gate — no token-guessing oracle beyond
-    // Slack's own rate limits.
-    if (config.pairToken !== undefined && command === 'pair') {
+    // Slack's own rate limits. asCommand returns the whole remainder, so the
+    // verb is matched as the first token: `/pair <secret>` must reach here.
+    if (config.pairToken !== undefined && command !== undefined && /^pair(\s|$)/.test(command)) {
       if (text.slice(5).trim() === config.pairToken) {
         sessions.enroll(channel)
         return sendReplyText(channel, event.ts, 'Paired — this channel is now authorized.')
@@ -308,6 +353,9 @@ export function apply(ctx, config) {
     } catch { /* already reported */ }
     try {
       await eventChain
+    } catch { /* already reported */ }
+    try {
+      await identityProbe
     } catch { /* already reported */ }
     if (typeof offEvent === 'function') offEvent()
     if (typeof offError === 'function') offError()
