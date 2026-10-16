@@ -61,3 +61,12 @@
         #                          # (DMs are never gated); gated messages are
         #                          # kept and handed to the next addressed turn
         # contextMessages: 20      # how many unseen messages that turn carries
+        # Mentions the agent's own text may turn into a real Slack mention.
+        # Reply text is escaped (nothing can become a link or a ping by
+        # accident), which also escapes "<@U...>": only ids listed here come
+        # back as mentions. Empty (the default) keeps every agent-written
+        # mention as text; the automatic mention-back to the message's author
+        # still works either way.
+        # mentionUserIds:
+        #   - U0C7AN52QGN
+        #   - U0C6HEG8KC6

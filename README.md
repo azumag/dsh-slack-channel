@@ -186,9 +186,29 @@ the web interface.
 | `threadReplies` | `true` | Reply in-thread on the originating message. |
 | `ackReaction` | `hourglass` | Emoji reaction marking the message being worked on (empty string disables). |
 | `mentionOnly` | `false` | Serve only messages that address the bot (or one of its commands). DMs are never gated. Messages that are gated become context, not silence — see below. |
+| `mentionUserIds` | `[]` | Slack user ids (`U…`) the agent's own text may turn into a real mention. Empty keeps every agent-written `<@U…>` as escaped text — see below. |
 | `contextMessages` | `20` | How many unseen messages a mention-driven turn carries as context (`0` disables the buffer, `200` is the cap). |
 | `retryDelayMs` | `3000` | Backoff after Web API failures. |
 | `socketRetryDelayMs` | `2000` | Backoff between Socket Mode reconnects. |
+
+### Mentions in replies
+
+Reply text is escaped: outside code spans every `<`, `>` and `&` becomes `&lt;`, `&gt;`, `&amp;`, so nothing the model writes can become a link (`<https://…|click>`) or ping someone by accident. That includes `<@U…>` — a mention the agent types in its own reply is posted as literal text unless the id is listed in `mentionUserIds`:
+
+```yaml
+mentionUserIds:
+  - U0C7AN52QGN   # teammate agent
+  - U0C6HEG8KC6   # teammate agent
+```
+
+Only those ids come back as real mentions; every other `<@U…>` — and every other angle-bracket form — stays escaped. The list is validated (empty entries, non-strings and `<@…>` wrappers are rejected at load) and de-duplicated.
+
+Two mentions never need the allowlist:
+
+- The first chunk of a reply is prefixed with a mention of the author of the message that drove the turn, whenever that message addressed the bot. That prefix is added *after* escaping, so it always resolves.
+- Code spans and fenced blocks are never escaped, but Slack renders mentions inside them as code — they stay text.
+
+An empty `mentionUserIds` (the default) is the safe posture for a channel where the agent should never address anyone: only the automatic mention-back above reaches a human or another app.
 
 ### Mention gating and context
 
@@ -206,7 +226,7 @@ Gated messages are not discarded. They are remembered per channel (the last `con
 <@U123> what do you think?
 ```
 
-The block is consumed by that turn, so each unseen message is carried exactly once; the session then holds it as ordinary history. Attribution is the raw mention spelling (`<@U…>`), which the agent can also use to address someone in its reply. Messages longer than 1500 characters are truncated inside the block, and a composition that gates nothing never allocates the buffer at all.
+The block is consumed by that turn, so each unseen message is carried exactly once; the session then holds it as ordinary history. Attribution is the raw mention spelling (`<@U…>`) — the form the agent can address someone with in its reply, provided that id is in `mentionUserIds` (see *Mentions in replies*). Messages longer than 1500 characters are truncated inside the block, and a composition that gates nothing never allocates the buffer at all.
 
 ## Troubleshooting
 
@@ -218,6 +238,7 @@ The block is consumed by that turn, so each unseen message is carried exactly on
 | Connects, but nothing at all arrives | event subscriptions missing | *Event Subscriptions* → `message.channels` / `message.groups` / `message.im`, Save |
 | Reply lands but no ⏳ reaction | `reactions:write` scope missing | add the scopes, reinstall |
 | Two replies per message | `app_mention` subscribed alongside `message.channels` | remove `app_mention` from the event subscriptions |
+| A reply shows `&lt;@U…&gt;` instead of a mention | the id is not in `mentionUserIds`, so the mention stayed escaped | add the id (mentions the agent writes are escaped by design — see *Mentions in replies*) |
 | Socket Mode connects, then drops periodically | expected | Slack recycles connections; the plugin reconnects automatically with a fresh URL |
 
 ## Security
@@ -249,7 +270,7 @@ There is also a live smoke test without an LLM: `node smoke.mjs` mounts the plug
 - **No slash-command integration** — commands are plain chat text ("/new"); Slack's interactivity/slash-command payloads are acked and ignored.
 - **One turn per channel at a time** — concurrent messages queue; they are not steering.
 - **Approval questions** are not surfaced on Slack; mount this plugin in a composition whose policy does not require interactive approval.
-- **Agents can ping each other** — every message that mentions the bot is answered with a mention of its author, and messages from other apps are served. In a channel where several agent apps all reply to each other, that can sustain a conversation between them. The plugin answers one turn per channel and only when a message arrives, so it is not a runaway loop by itself, but a channel like that is worth watching for cost. Gate it by only forwarding messages that mention the bot, or by skipping `bot_message` senders in `mentionBackTarget`. Also note that a channel where the bot is present is served *whether or not* the bot is mentioned (`allowAllChannels`, or a listed channel): mention-back is not mention-gating.
+- **Agents can ping each other** — every message that mentions the bot is answered with a mention of its author, and messages from other apps are served. In a channel where several agent apps all reply to each other, that can sustain a conversation between them. The plugin answers one turn per channel and only when a message arrives, so it is not a runaway loop by itself, but a channel like that is worth watching for cost. An agent's own mentions reach Slack only for ids in `mentionUserIds`, so keep that list to the participants that should be addressable. Gate it further by only forwarding messages that mention the bot, or by skipping `bot_message` senders in `mentionBackTarget`. Also note that a channel where the bot is present is served *whether or not* the bot is mentioned (`allowAllChannels`, or a listed channel): mention-back is not mention-gating.
 
 ## Files
 
@@ -261,7 +282,7 @@ src/index.js            entry: name / inject / Config / apply — socket loop wi
 src/schema.js           Standard Schema v1 config validator (inline, no deps)
 src/slack.js            Web API client: call / openConnections / postMessage / reactions, splitMessage
 src/socket.js           Socket Mode loop: fresh-URL reconnect, envelope acks, event routing
-src/format.js           markdown → Slack mrkdwn (escaped angle brackets, fences preserved)
+src/format.js           markdown → Slack mrkdwn (escaped angle brackets, allowlisted mentions restored, fences preserved)
 src/message.js          frozen user-message factory (dsh-llm createUserMessage shape)
 src/collector.js        per-turn reply collector (last/all)
 src/sessions.js         per-channel agent manager (create/resume, state file, enrollments)

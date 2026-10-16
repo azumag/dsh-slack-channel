@@ -12,6 +12,14 @@ const REPLY_MODES = ['last', 'all']
 /** Hard cap on the context block, whatever the config asks for. */
 const CONTEXT_MESSAGES_MAX = 200
 
+/**
+ * Slack user ids that may be mentioned back at the channel (U… bots and
+ * humans alike; W… legacy workspace users). Deliberately loose about case and
+ * separators so fixtures and hand-written ids both validate — an entry that
+ * does not match simply never turns into a mention.
+ */
+const SLACK_USER_ID = /^[UW][A-Za-z0-9_-]{1,}$/
+
 const DEFAULTS = Object.freeze({
   apiBase: 'https://slack.com/api',
   allowedChannelIds: [],
@@ -24,6 +32,7 @@ const DEFAULTS = Object.freeze({
   ackReaction: 'hourglass',
   notifyUnauthorized: false,
   mentionOnly: false,
+  mentionUserIds: [],
   contextMessages: 20,
 })
 
@@ -175,6 +184,27 @@ function validate(input) {
   // and attached to the next turn that does address the bot, so the agent
   // still sees the conversation it was not asked to answer.
   cfg.mentionOnly = src.mentionOnly === undefined ? DEFAULTS.mentionOnly : !!src.mentionOnly
+
+  // Mention allowlist: the only ids the agent's own text may turn into a real
+  // Slack mention. The formatter escapes < > & outside code spans so model
+  // output cannot ping anyone by accident; ids listed here are restored after
+  // escaping. Empty (the default) keeps every agent-typed mention as text.
+  const mentionIds = src.mentionUserIds ?? DEFAULTS.mentionUserIds
+  if (!Array.isArray(mentionIds)) {
+    issues.push({ message: 'mentionUserIds must be an array of Slack user ids (strings)' })
+    cfg.mentionUserIds = []
+  } else {
+    const ids = []
+    for (const id of mentionIds) {
+      if (typeof id !== 'string' || !SLACK_USER_ID.test(id)) {
+        issues.push({ message: 'mentionUserIds entries must be Slack user ids like U0123ABCD, got ' + JSON.stringify(id) })
+        continue
+      }
+      if (!ids.includes(id)) ids.push(id)
+    }
+    cfg.mentionUserIds = ids
+  }
+
   cfg.contextMessages = nonNegativeNumber(src.contextMessages, DEFAULTS.contextMessages)
   if (cfg.contextMessages === undefined || cfg.contextMessages > CONTEXT_MESSAGES_MAX) {
     issues.push({ message: 'contextMessages must be a number in [0, ' + CONTEXT_MESSAGES_MAX + ']' })

@@ -22,9 +22,13 @@ const FENCE = '```'
  *   final fence is closed so the chunk renders standalone.
  * - Inline backtick spans pass through; unbalanced inline backticks are
  *   escaped wholesale.
- * - Everything else gets & < > escaped so no accidental links or mentions.
+ * - Everything else gets & < > escaped so no accidental links or mentions,
+ *   EXCEPT the user ids in options.mentionUserIds: those are restored as real
+ *   <@U123> mentions. The allowlist is what lets an agent address a named
+ *   teammate without letting it ping anyone it can name; with no allowlist
+ *   (the default) every mention the model writes stays escaped text.
  */
-export function toSlackMrkdwn(text) {
+export function toSlackMrkdwn(text, options) {
   const lines = text.split('\n')
   const out = []
   let inFence = false
@@ -41,7 +45,25 @@ export function toSlackMrkdwn(text) {
     out.push(escapeInline(line))
   }
   if (inFence) out.push(FENCE)
-  return out.join('\n')
+  return allowMentions(out.join('\n'), options?.mentionUserIds)
+}
+
+/**
+ * Restore the allowed <@U123> / <@U123|name> spellings that escaping turned
+ * into text. Everything else stays escaped, so an id outside the allowlist —
+ * or any other angle-bracket syntax — still cannot reach Slack as a link or a
+ * mention. Ids are matched literally (regex metacharacters are quoted).
+ */
+function allowMentions(text, ids) {
+  if (!Array.isArray(ids) || ids.length === 0) return text
+  let out = text
+  for (const id of ids) {
+    if (typeof id !== 'string' || id.length === 0) continue
+    const quoted = id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const pattern = new RegExp('&lt;@' + quoted + '(\\|[^&<>]*)?&gt;', 'g')
+    out = out.replace(pattern, (_, label) => '<@' + id + (label === undefined ? '' : label) + '>')
+  }
+  return out
 }
 
 /** Escape a line outside fences, passing inline code spans through. */

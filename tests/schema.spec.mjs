@@ -21,6 +21,7 @@ test('defaults apply to an empty config', () => {
   equal(value.ackReaction, 'hourglass')
   equal(value.notifyUnauthorized, false)
   equal(value.mentionOnly, false)
+  equal(value.mentionUserIds, [])
   equal(value.contextMessages, 20)
   equal(value.botToken, undefined)
   equal(value.appToken, undefined)
@@ -36,6 +37,24 @@ test('mentionOnly and contextMessages accept values within bounds', () => {
   assert(tooBig.issues !== undefined, 'contextMessages above the cap is rejected')
   const negative = validate({ contextMessages: -1 })
   assert(negative.issues !== undefined, 'a negative contextMessages is rejected')
+})
+
+test('mentionUserIds validates, de-duplicates and defaults to empty', () => {
+  const none = validate({})
+  equal(none.value.mentionUserIds, [])
+
+  const ok = validate({ mentionUserIds: ['U0C7AN52QGN', 'U0C6HEG8KC6', 'U0C7AN52QGN'] })
+  assert(ok.issues === undefined, 'real-looking ids pass: ' + JSON.stringify(ok.issues))
+  equal(ok.value.mentionUserIds, ['U0C7AN52QGN', 'U0C6HEG8KC6'], 'duplicates collapse, order kept')
+
+  const notArray = validate({ mentionUserIds: 'U0C7AN52QGN' })
+  assert(notArray.issues !== undefined, 'a bare string is rejected')
+
+  // The schema reports issues INSTEAD of a value, so a bad entry surfaces
+  // rather than being silently dropped.
+  const bad = validate({ mentionUserIds: ['U0C7AN52QGN', '<@U0C6HEG8KC6>', 42, ''] })
+  assert(bad.issues !== undefined, 'bad entries are reported')
+  equal(bad.value, undefined, 'no value is handed out while issues stand')
 })
 
 test('valid values pass through', () => {

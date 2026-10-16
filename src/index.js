@@ -61,6 +61,11 @@ export function apply(ctx, config) {
   const warnedChannels = new Set()
   const abort = new AbortController()
 
+  // Handed to every formatter call: model output is escaped wholesale, so the
+  // ids in config.mentionUserIds are the only ones that survive as real Slack
+  // mentions (see format.js). An empty allowlist keeps them all as text.
+  const mrkdwnOptions = { mentionUserIds: config.mentionUserIds }
+
   /**
    * Identities of THIS bot (auth.test's bot_id and user_id). Other
    * integrations post with their own bot_id, so the self-echo guard needs
@@ -203,7 +208,7 @@ export function apply(ctx, config) {
     for (const raw of splitMessage(text, config.maxReplyChars)) {
       const prefix = first === true && record.mentionUserId !== undefined ? '<@' + record.mentionUserId + '> ' : ''
       first = false
-      const body = prefix + toSlackMrkdwn(raw)
+      const body = prefix + toSlackMrkdwn(raw, mrkdwnOptions)
       // Safety valve: escaping can grow a chunk past the intended cap.
       for (const piece of splitMessage(body, config.maxReplyChars + 64)) {
         try {
@@ -424,7 +429,7 @@ export function apply(ctx, config) {
   /** Post a control/notice message (commands, acks) into a thread. */
   async function sendReplyText(channel, ts, text) {
     for (const raw of splitMessage(text, config.maxReplyChars)) {
-      const body = toSlackMrkdwn(raw)
+      const body = toSlackMrkdwn(raw, mrkdwnOptions)
       try {
         await slack.postMessage(channel, body, {
           threadTs: config.threadReplies === true ? ts : undefined,

@@ -37,3 +37,37 @@ test('unbalanced fence still closes', () => {
 test('plain lines are escaped', () => {
   equal(toSlackMrkdwn('a<b> & c'), 'a&lt;b&gt; &amp; c')
 })
+
+test('no allowlist keeps every agent-typed mention as text', () => {
+  equal(toSlackMrkdwn('<@U123ABC> hi'), '&lt;@U123ABC&gt; hi')
+  equal(toSlackMrkdwn('<@U123ABC> hi', { mentionUserIds: [] }), '&lt;@U123ABC&gt; hi')
+})
+
+test('an allowlisted id comes back as a real mention', () => {
+  const options = { mentionUserIds: ['U123ABC'] }
+  equal(toSlackMrkdwn('<@U123ABC> hi', options), '<@U123ABC> hi')
+  equal(toSlackMrkdwn('ping <@U123ABC> now', options), 'ping <@U123ABC> now')
+  equal(toSlackMrkdwn('<@U123ABC|hermes> hi', options), '<@U123ABC|hermes> hi')
+  equal(toSlackMrkdwn('<@U123ABC>' + NL + 'body', options), '<@U123ABC>' + NL + 'body', 'leading line')
+})
+
+test('ids outside the allowlist stay escaped', () => {
+  const options = { mentionUserIds: ['U123ABC'] }
+  equal(toSlackMrkdwn('<@U999ZZZ> hi', options), '&lt;@U999ZZZ&gt; hi')
+  equal(toSlackMrkdwn('<@U123ABC> <@U999ZZZ>', options), '<@U123ABC> &lt;@U999ZZZ&gt;')
+  equal(toSlackMrkdwn('<@U123AB> hi', options), '&lt;@U123AB&gt; hi', 'a prefix is not a match')
+  equal(toSlackMrkdwn('<@U123ABCX> hi', options), '&lt;@U123ABCX&gt; hi', 'a longer id is not a match')
+})
+
+test('the allowlist never unescapes links or other angle brackets', () => {
+  const options = { mentionUserIds: ['U123ABC'] }
+  equal(
+    toSlackMrkdwn('see <https://evil.example|click> and <b>', options),
+    'see &lt;https://evil.example|click&gt; and &lt;b&gt;',
+  )
+  equal(toSlackMrkdwn('a < b & <@U123ABC>', options), 'a &lt; b &amp; <@U123ABC>')
+})
+
+test('an allowlisted id inside a code span stays code', () => {
+  equal(toSlackMrkdwn('run `<@U123ABC>` now', { mentionUserIds: ['U123ABC'] }), 'run `<@U123ABC>` now')
+})

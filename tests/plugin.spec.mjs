@@ -195,6 +195,34 @@ test('own echoes are ignored while another app is served', async () => {
   }
 })
 
+test('a reply mentions only the allowlisted ids', async () => {
+  const mock = await startMockSlack()
+  mock.setHandler((method) => {
+    if (method === 'auth.test') return { reply: { ok: true, bot_id: 'B-SELF', user_id: 'U-BOT' } }
+    return undefined
+  })
+  try {
+    const h = await mountConnected(mock, { mentionUserIds: ['U-APP'] })
+    await waitFor(() => h.sockets.length > 0 && h.sockets[0].listeners.message?.length > 0)
+    await waitFor(() => mock.calls.some((c) => c.method === 'auth.test'))
+    await sleep(200)
+
+    h.push(messageEvent('C42', '<@U-BOT> first'))
+    await waitFor(() => h.created.length === 1)
+    h.created[0].script.push('<@U-APP> hermes へ <@U-NOPE> と <https://x.example|link>')
+    h.push(messageEvent('C42', '<@U-BOT> second'))
+
+    await waitFor(() => h.sent().some((s) => s.text.includes('hermes へ')))
+    const body = h.sent().map((s) => s.text).find((t) => t.includes('hermes へ'))
+    assert(body.includes('<@U-APP> hermes へ'), 'the allowlisted id stays a real mention: ' + body)
+    assert(body.includes('&lt;@U-NOPE&gt;'), 'ids outside the allowlist stay escaped: ' + body)
+    assert(body.includes('&lt;https://x.example|link&gt;'), 'links stay escaped: ' + body)
+    await h.dispose()
+  } finally {
+    await mock.close()
+  }
+})
+
 test('a mention is answered with a mention of its author', async () => {
   const mock = await startMockSlack()
   mock.setHandler((method) => {
