@@ -16,6 +16,7 @@
 
 import { createTurnCollector } from './collector.js'
 import { toSlackMrkdwn } from './format.js'
+import { createInteractions } from './interactions.js'
 import { createTextUserMessage } from './message.js'
 import { Config } from './schema.js'
 import { createChatSessions } from './sessions.js'
@@ -34,6 +35,8 @@ const HELP_TEXT = [
   'Commands (prefer the ! prefix — Slack intercepts leading / as its own slash commands):',
   '!new — start a fresh session (clears channel memory)',
   '!stop — cancel the running turn',
+  '!allow / !deny — answer the approval prompt this channel is waiting on',
+  '!answer <text> — answer the question prompt in your own words',
   '!id — show this channel id (for allowedChannelIds)',
   '!pair <token> — enroll this channel (when pairToken is configured)',
   '!help — this text',
@@ -65,6 +68,11 @@ export function apply(ctx, config) {
   // ids in config.mentionUserIds are the only ones that survive as real Slack
   // mentions (see format.js). An empty allowlist keeps them all as text.
   const mrkdwnOptions = { mentionUserIds: config.mentionUserIds }
+
+  // Interactive prompts (permission approvals and ask_user_question) for the
+  // sessions this plugin owns are answered from Slack — see interactions.js.
+  // `authorized` is hoisted, so the manager can capture it here.
+  const interactions = createInteractions({ config, logger, slack, sessions, authorized, mrkdwnOptions })
 
   /**
    * Identities of THIS bot (auth.test's bot_id and user_id). Other
@@ -324,6 +332,17 @@ export function apply(ctx, config) {
     record.lastError = errorText(payload.error)
   })
 
+  // Interactive-prompt path: a channel session has no GUI of its own, so an
+  // approval or an ask_user_question request used to wait on a DSH client that
+  // may never answer — the turn, and with it the channel, stayed blocked (every
+  // later message queued) until the host restarted. These listeners are
+  // PREPENDED so an owned agent's prompt always reaches Slack, while the rest
+  // of the waterfall stays live: interactions.js races the other answerers and
+  // settles at the configured deadline, so nothing can wedge the channel.
+  // Foreign agents (subagents, web sessions) are delegated untouched inside.
+  const offApproval = ctx.on('approval/request', (request, next) => interactions.answerApproval(request, next), { prepend: true })
+  const offQuestions = ctx.on('user-questions/request', (request, next) => interactions.answerQuestion(request, next), { prepend: true })
+
   /**
    * Handle one Slack message event. Only `message` events are accepted —
    * the manifest should not subscribe `app_mention` (Slack would deliver
@@ -387,6 +406,26 @@ export function apply(ctx, config) {
       return sendReplyText(channel, event.ts, 'Stop requested.')
     }
 
+    // Interactive prompts are answered by the buttons on the prompt message;
+    // these commands are the text equivalents (`!answer` is also the free-form
+    // "Other" path for a question that has buttons). Both report when nothing
+    // is waiting, so a typo is not silently swallowed.
+    const verb = command === undefined ? undefined : command.split(/\s+/)[0]
+    if (verb === 'allow' || verb === 'deny') {
+      if (interactions.answerFromText(channel, verb, '', event.user) === true) return
+      return sendReplyText(channel, event.ts, 'Nothing is waiting for approval.')
+    }
+    if (verb === 'answer') {
+      const body = command.slice(verb.length).trim()
+      if (body.length === 0) return sendReplyText(channel, event.ts, 'Usage: !answer <text>')
+      if (interactions.answerFromText(channel, verb, body, event.user) === true) return
+      return sendReplyText(channel, event.ts, 'Nothing is waiting for an answer.')
+    }
+    // A plain message answers an option-less question prompt: there is nothing
+    // to click for one, and the turn is blocked on it anyway. Every other
+    // message keeps its ordinary meaning (gating below, then a turn or queue).
+    if (command === undefined && interactions.answerFromText(channel, undefined, text, event.user) === true) return
+
     // Mention gating: with mentionOnly on, a channel message that does not
     // address the bot drives no turn — it is remembered instead, to be handed
     // to the next message that does. DMs are always addressed to the bot and
@@ -421,7 +460,10 @@ export function apply(ctx, config) {
     if (record.busy) {
       record.queue.push({ text: prompt, ts: event.ts, mentionUserId: mentionBackTarget(event, text) })
       if (config.ackQueued === false) return
-      return sendReplyText(channel, event.ts, 'Queued (' + record.queue.length + ' pending).')
+      // A queue behind a prompt is not the agent thinking: say what it waits
+      // for, so a silent channel is never mistaken for a wedged one.
+      const waiting = interactions.hasPending(channel) ? ' Answer the prompt above to continue.' : ''
+      return sendReplyText(channel, event.ts, 'Queued (' + record.queue.length + ' pending).' + waiting)
     }
     startTurn(record, prompt, event.ts, mentionBackTarget(event, text))
   }
@@ -455,6 +497,15 @@ export function apply(ctx, config) {
         .then(() => handleEvent(event))
         .catch((error) => logger.warn('event handling failed: ' + errorText(error)))
     },
+    // Button clicks ride the same chain as events: a click that answers a
+    // prompt and rewrites its message stays ordered against the posts around
+    // it, and a slow handler can never interleave two Slack writes.
+    onInteractive: (payload) => {
+      eventChain = eventChain
+        .then(() => interactions.handleInteractive(payload))
+        .catch((error) => logger.warn('interaction handling failed: ' + errorText(error)))
+      return eventChain
+    },
     signal: abort.signal,
     logger,
     retryDelayMs: config.socketRetryDelayMs,
@@ -478,6 +529,11 @@ export function apply(ctx, config) {
     } catch { /* already reported */ }
     if (typeof offEvent === 'function') offEvent()
     if (typeof offError === 'function') offError()
+    if (typeof offApproval === 'function') offApproval()
+    if (typeof offQuestions === 'function') offQuestions()
+    // Settle every prompt still waiting: the sessions are about to go, and a
+    // prompt that outlived them would hold the approval/question call forever.
+    interactions.disposeAll()
     await sessions.disposeAll()
   }
 }

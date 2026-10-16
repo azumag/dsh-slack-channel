@@ -23,8 +23,25 @@ test('defaults apply to an empty config', () => {
   equal(value.mentionOnly, false)
   equal(value.mentionUserIds, [])
   equal(value.contextMessages, 20)
+  equal(value.interactiveTimeoutMs, 1800000)
   equal(value.botToken, undefined)
   equal(value.appToken, undefined)
+})
+
+test('interactiveTimeoutMs takes a deadline, 0, and rejects nonsense', () => {
+  const ok = validate({ interactiveTimeoutMs: 60000 })
+  assert(ok.issues === undefined, 'a positive deadline passes')
+  equal(ok.value.interactiveTimeoutMs, 60000)
+
+  const forever = validate({ interactiveTimeoutMs: 0 })
+  assert(forever.issues === undefined, '0 means "wait until the turn is stopped"')
+  equal(forever.value.interactiveTimeoutMs, 0)
+
+  const negative = validate({ interactiveTimeoutMs: -1 })
+  assert(negative.issues !== undefined, 'a negative deadline is rejected')
+
+  const tooBig = validate({ interactiveTimeoutMs: 25 * 60 * 60 * 1000 })
+  assert(tooBig.issues !== undefined, 'a deadline beyond the 24h cap is rejected')
 })
 
 test('mentionOnly and contextMessages accept values within bounds', () => {

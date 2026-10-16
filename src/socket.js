@@ -16,6 +16,8 @@ import { sleep } from './slack.js'
  * @param options.slack - a SlackClient (openConnections uses the app token).
  * @param options.onEvent - receives each Slack event
  *   (payload.event of events_api envelopes).
+ * @param options.onInteractive - receives each interactive payload
+ *   (payload of interactive envelopes: Block Kit button clicks).
  * @param options.signal - aborts the loop (plugin teardown).
  * @param options.logger - named plugin logger for diagnostics.
  * @param options.retryDelayMs - backoff after failures and disconnects.
@@ -23,7 +25,7 @@ import { sleep } from './slack.js'
  *   addEventListener('open'|'message'|'close'|'error', fn), send(string),
  *   close(). Defaults to globalThis.WebSocket.
  */
-export async function runSocketLoop({ slack, onEvent, signal, logger, retryDelayMs = 2000, wsFactory }) {
+export async function runSocketLoop({ slack, onEvent, onInteractive, signal, logger, retryDelayMs = 2000, wsFactory }) {
   const factory = wsFactory ?? (async (url) => new WebSocket(url))
   while (signal.aborted === false) {
     let url
@@ -74,6 +76,18 @@ export async function runSocketLoop({ slack, onEvent, signal, logger, retryDelay
             onEvent(slackEvent)
           } catch (error) {
             logger.warn('event handling failed: ' + errorText(error))
+          }
+        }
+      } else if (envelope.type === 'interactive') {
+        // Block Kit clicks arrive as their own envelope type. The ack above is
+        // already sent; the handler is async (it answers a pending prompt and
+        // rewrites the message), so its rejection is contained here.
+        const payload = envelope.payload
+        if (payload !== undefined && onInteractive !== undefined) {
+          try {
+            Promise.resolve(onInteractive(payload)).catch((error) => logger.warn('interaction handling failed: ' + errorText(error)))
+          } catch (error) {
+            logger.warn('interaction handling failed: ' + errorText(error))
           }
         }
       }

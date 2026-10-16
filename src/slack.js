@@ -98,8 +98,10 @@ export class SlackClient {
    * Post one channel message. Slack messages are mrkdwn; the caller passes
    * already-converted text.
    * @param channelId - target channel (C…/G…/D…).
-   * @param text - the message text; the caller pre-split it to the limit.
-   * @param options - threadTs (reply in-thread), and abort signal.
+   * @param text - the message text; the caller pre-split it to the limit. It
+   *   is also the notification fallback when blocks are supplied.
+   * @param options - threadTs (reply in-thread), blocks (Block Kit payload,
+   *   e.g. the approval/question prompts), and abort signal.
    * @returns { channel, ts } of the posted message.
    */
   async postMessage(channelId, text, options = {}) {
@@ -110,16 +112,23 @@ export class SlackClient {
       unfurl_media: false,
     }
     if (options.threadTs !== undefined) payload.thread_ts = options.threadTs
-    try {
-      return await this.call('chat.postMessage', this.#botToken, payload, options)
-    } catch (error) {
-      const isRateLimit = error instanceof SlackApiError
-        && error.status === 429
-        && typeof error.retryAfterMs === 'number'
-      if (!isRateLimit) throw error
-      await sleep(error.retryAfterMs + 250, options.signal)
-      return this.call('chat.postMessage', this.#botToken, payload, options)
-    }
+    if (Array.isArray(options.blocks)) payload.blocks = options.blocks
+    return retryOnRateLimit(() => this.call('chat.postMessage', this.#botToken, payload, options), options)
+  }
+
+  /**
+   * Replace one previously posted message (chat.update). A settled prompt
+   * retires its buttons this way, so a stale click can never decide twice.
+   * @param channelId - the channel holding the message.
+   * @param timestamp - the message's ts.
+   * @param text - the replacement text (notification fallback with blocks).
+   * @param options - blocks (Block Kit payload), and abort signal.
+   * @returns { channel, ts } of the updated message.
+   */
+  async updateMessage(channelId, timestamp, text, options = {}) {
+    const payload = { channel: channelId, ts: timestamp, text }
+    if (Array.isArray(options.blocks)) payload.blocks = options.blocks
+    return retryOnRateLimit(() => this.call('chat.update', this.#botToken, payload, options), options)
   }
 
   /**
@@ -145,6 +154,23 @@ export class SlackClient {
     } catch {
       return false
     }
+  }
+}
+
+/**
+ * Run one Web API call, retrying exactly once after the backoff a 429 response
+ * asked for. Any other failure propagates untouched.
+ */
+async function retryOnRateLimit(work, options) {
+  try {
+    return await work()
+  } catch (error) {
+    const isRateLimit = error instanceof SlackApiError
+      && error.status === 429
+      && typeof error.retryAfterMs === 'number'
+    if (!isRateLimit) throw error
+    await sleep(error.retryAfterMs + 250, options.signal)
+    return work()
   }
 }
 

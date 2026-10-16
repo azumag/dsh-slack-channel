@@ -34,7 +34,11 @@ const DEFAULTS = Object.freeze({
   mentionOnly: false,
   mentionUserIds: [],
   contextMessages: 20,
+  interactiveTimeoutMs: 30 * 60 * 1000,
 })
+
+/** Hard cap on the interactive-prompt deadline (24h), whatever the config asks. */
+const INTERACTIVE_TIMEOUT_MAX = 24 * 60 * 60 * 1000
 
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -209,6 +213,16 @@ function validate(input) {
   if (cfg.contextMessages === undefined || cfg.contextMessages > CONTEXT_MESSAGES_MAX) {
     issues.push({ message: 'contextMessages must be a number in [0, ' + CONTEXT_MESSAGES_MAX + ']' })
     cfg.contextMessages = DEFAULTS.contextMessages
+  }
+
+  // How long an interactive prompt (an approval, or an ask_user_question call)
+  // waits in the channel before it fails closed. 0 waits forever — the prompt
+  // then ends only when the turn is stopped. The config is what keeps a
+  // channel from being blocked by a prompt nobody is watching.
+  cfg.interactiveTimeoutMs = nonNegativeNumber(src.interactiveTimeoutMs, DEFAULTS.interactiveTimeoutMs)
+  if (cfg.interactiveTimeoutMs === undefined || cfg.interactiveTimeoutMs > INTERACTIVE_TIMEOUT_MAX) {
+    issues.push({ message: 'interactiveTimeoutMs must be a number in [0, ' + INTERACTIVE_TIMEOUT_MAX + '] (0 waits forever)' })
+    cfg.interactiveTimeoutMs = DEFAULTS.interactiveTimeoutMs
   }
 
   // Optional channel→session persistence so restarts resume conversations,

@@ -29,6 +29,10 @@ const ctx = {
   }),
   on(event, fn) { ;(listeners[event] ??= []).push(fn); return () => {} },
   effect() {},
+  // Optional services the plugin consults (agent-default-model for an unset
+  // route, permission/agent presets): undefined here, so the composition
+  // defaults stand.
+  get: () => undefined,
   agents: {
     async create(options) {
       const agent = {

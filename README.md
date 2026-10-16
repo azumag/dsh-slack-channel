@@ -16,6 +16,9 @@ Pure `fetch` + the platform `WebSocket` — no npm dependencies, no build step, 
 | errors | `agent/error` quoted back to the channel |
 | a message that mentions the bot | the reply opens with a mention of that message's author (`<@U123>`) |
 | a message from another app | served like any other message — one agent, several integrations in one channel |
+| a permission approval (`approval/request`) | posted as a Block Kit prompt with **Allow once** / **Deny** buttons; the click decides the request |
+| an `ask_user_question` call | posted as its options, one button each; a free-form question is answered by a plain channel reply |
+| nobody answers a prompt | it expires (`interactiveTimeoutMs`, 30 minutes by default) and the turn continues fail-closed, so the channel is never left blocked |
 
 Sessions are created through `ctx.agents` (`inject: ['agents']`), so each channel gets a real DSH session with its own history, tools, and model route. `auth.test` identifies this bot once at startup: its own messages are skipped so the agent never reacts to itself, while messages from **other** apps (their own `bot_id`) are served. Every other `subtype` — edits, deletes, joins, thread broadcasts — is a trace and never drives the agent.
 
@@ -30,7 +33,7 @@ Mention-back covers humans and apps alike: whoever wrote `<@our-id>` gets `<@the
 
 ## Slack app setup (10 minutes)
 
-Create the app at [api.slack.com/apps](https://api.slack.com/apps) → *Create New App* → *From scratch* → name it (e.g. `deepseeker`), pick your workspace. Then four stops in the app's settings:
+Create the app at [api.slack.com/apps](https://api.slack.com/apps) → *Create New App* → *From scratch* → name it (e.g. `deepseeker`), pick your workspace. Then five stops in the app's settings:
 
 ### 1. App-level token (`xapp-…`) — *Basic Information* page
 
@@ -62,7 +65,11 @@ Then scroll up that page → **Install to Workspace** → **Allow** → copy the
 
 Toggle **On**. (This is what the `xapp-` token is for; without it the plugin can't connect — and you never need a public URL or TLS.)
 
-### 4. Event subscriptions — *Event Subscriptions* page
+### 4. Interactivity — *Interactivity & Shortcuts* page
+
+Toggle **On** and leave the Request URL empty: with Socket Mode the click payloads arrive over the same websocket. This is what makes the **Allow once** / **Deny** buttons on an approval prompt (and the option buttons of an `ask_user_question` prompt) work. The text fallbacks — `!allow`, `!deny`, `!answer <text>` — keep working without it.
+
+### 5. Event subscriptions — *Event Subscriptions* page
 
 Toggle **Enable Events** → *Subscribe to bot events* → add exactly:
 
@@ -74,7 +81,7 @@ Toggle **Enable Events** → *Subscribe to bot events* → add exactly:
 
 > ⚠️ Do **not** subscribe `app_mention` — Slack would deliver both the mention and the underlying message, and the agent would answer twice.
 
-### 5. Invite the bot and grab a channel id
+### 6. Invite the bot and grab a channel id
 
 In Slack: `/invite @yourbot` in the channel you want served (DMs need no invite — find the bot under **Apps** in your sidebar).
 
@@ -136,11 +143,15 @@ the bot. A leading space (` /new`) also gets through; both spellings work.
 |---|---|
 | !new (or /new) | dispose the channel's session and start a fresh one |
 | !stop (or /stop) | cancel the running turn and clear the queue |
+| !allow / !deny | decide the approval prompt this channel is waiting on (the buttons do the same) |
+| !answer <text> | answer the pending question in your own words — the "Other" path for a question that has buttons |
 | !id (or /id) | reply with the channel id (for `allowedChannelIds`) |
 | !pair <token> (or /pair) | enroll this channel when `pairToken` is configured |
 | !help, !start (or /…) | command summary |
 
 Anything else goes to the agent as a user message. Messages posted while the agent is busy are queued per channel and drained in order (with a configurable ack). Replies post in-thread when `threadReplies` is on.
+
+One exception: while a question prompt is waiting in the channel, a plain message **that is not one of the commands above** answers the oldest unanswered *free-form* question (one with no options to click). Questions that offer options are answered by their buttons, or with `!answer …` for a reply that is not on the list.
 
 ## Using Slack as a remote DSH interface
 
@@ -188,6 +199,7 @@ the web interface.
 | `mentionOnly` | `false` | Serve only messages that address the bot (or one of its commands). DMs are never gated. Messages that are gated become context, not silence — see below. |
 | `mentionUserIds` | `[]` | Slack user ids (`U…`) the agent's own text may turn into a real mention. Empty keeps every agent-written `<@U…>` as escaped text — see below. |
 | `contextMessages` | `20` | How many unseen messages a mention-driven turn carries as context (`0` disables the buffer, `200` is the cap). |
+| `interactiveTimeoutMs` | `1800000` (30 min) | How long a Slack approval/question prompt waits before it is settled without an answer (`0` waits until the turn is stopped, `86400000` is the cap). |
 | `retryDelayMs` | `3000` | Backoff after Web API failures. |
 | `socketRetryDelayMs` | `2000` | Backoff between Socket Mode reconnects. |
 
@@ -228,6 +240,20 @@ Gated messages are not discarded. They are remembered per channel (the last `con
 
 The block is consumed by that turn, so each unseen message is carried exactly once; the session then holds it as ordinary history. Attribution is the raw mention spelling (`<@U…>`) — the form the agent can address someone with in its reply, provided that id is in `mentionUserIds` (see *Mentions in replies*). Messages longer than 1500 characters are truncated inside the block, and a composition that gates nothing never allocates the buffer at all.
 
+### Interactive prompts (approvals and questions)
+
+A channel session is a real DSH session, so it can stop and ask — for a permission (**run this command that needs to leave the sandbox?**) or for input (`ask_user_question`). Without help those prompts only exist in a DSH client that has the session open, which a Slack-driven session usually does not: the turn stays open, the channel's busy flag stays set, and every later message queues with no answer ever coming. The plugin answers both seams for the sessions it owns:
+
+- **Approval** — posted in the turn's thread with **Allow once** and **Deny** buttons, the tool name, and the reason the tool gave. The click closes the request (`allowed-once` / `rejected`); `!allow` / `!deny` do the same from the keyboard.
+- **`ask_user_question`** — posted with one button per option (per question, in a batch). A **multi-select** question toggles and commits with **Submit selection**. A free-form question — one with no options to click — is answered by a plain channel message; `!answer <text>` answers any question in your own words (the "Other" path).
+- **Settled prompts are rewritten in place**: the buttons are removed and the message shows who decided and what. A click on an already-settled prompt does nothing.
+
+The prompt is escaped exactly like a reply, so the tool's reason cannot smuggle a link or a `@channel` into the channel. The buttons carry an opaque prompt id, and a click from a channel that is not authorized is ignored.
+
+**Nothing waits forever.** A prompt that nobody answers is settled at `interactiveTimeoutMs` (30 minutes by default): an approval fails closed (`unavailable` — the operation is *not* approved), a question returns a timeout error to the model, and either way the turn finishes and the channel takes work again. Set a smaller value to fail fast in unattended channels, or `0` to wait until you `!stop` the turn.
+
+Other answerers in the composition are not bypassed: the prompt is also offered downstream (the DSH web UI, for example), whichever answers first wins, and a downstream answerer that declines to answer — no UI attached, or the session is not open there — leaves the channel in charge. A request from an agent this plugin does not own (a web session, another integration's agent) is delegated untouched; a *subagent* of a channel session is prompted in the channel it was delegated from, so a delegated approval cannot wedge the parent turn.
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
@@ -239,6 +265,8 @@ The block is consumed by that turn, so each unseen message is carried exactly on
 | Reply lands but no ⏳ reaction | `reactions:write` scope missing | add the scopes, reinstall |
 | Two replies per message | `app_mention` subscribed alongside `message.channels` | remove `app_mention` from the event subscriptions |
 | A reply shows `&lt;@U…&gt;` instead of a mention | the id is not in `mentionUserIds`, so the mention stayed escaped | add the id (mentions the agent writes are escaped by design — see *Mentions in replies*) |
+| Approval/question buttons do nothing | *Interactivity* is off for the Slack app | *Interactivity & Shortcuts* → **On** (no Request URL needed with Socket Mode); `!allow` / `!deny` / `!answer` work meanwhile |
+| A prompt says *Expired* although nobody answered | `interactiveTimeoutMs` elapsed | answer sooner, raise the value, or set `0` to wait indefinitely |
 | Socket Mode connects, then drops periodically | expected | Slack recycles connections; the plugin reconnects automatically with a fresh URL |
 
 ## Security
@@ -251,7 +279,7 @@ A bot token is a **credential**: whoever can post into a served channel can driv
 4. Restrict the composition the channel mounts into — don't give the Slack-facing host approval-free shell access unless you accept the risk.
 5. For enrollment without config edits, set `pairToken` (+ `stateFile`) and `/pair <token>` from the target channel. Enrollment is additive; remove ids from `state.json` to revoke.
 
-`agentPreset` decides how much of that composition a channel session gets. Left unset, sessions inherit only the profile-scoped plugins (MCP servers, workspace dependency tools): the agent can read GitHub objects its token allows but cannot open repository files or run commands. Setting it to `standard` (or any preset whose children include `tool-bash`/`tool-fs`) hands the channel the same tool set the web UI has — including in-workspace writes and command execution. Approval questions still never reach Slack, so operations the sandbox would ask about (writing outside `cwd`, for example) fail closed rather than prompting anyone.
+`agentPreset` decides how much of that composition a channel session gets. Left unset, sessions inherit only the profile-scoped plugins (MCP servers, workspace dependency tools): the agent can read GitHub objects its token allows but cannot open repository files or run commands. Setting it to `standard` (or any preset whose children include `tool-bash`/`tool-fs`) hands the channel the same tool set the web UI has — including in-workspace writes and command execution. Approval questions reach the channel as buttons, so whoever can post in the channel can also approve them: keep `permissionPreset` (and the sandbox it selects) as the real limit on what the agent may do unattended, and treat the buttons as a speed bump rather than a boundary between people.
 
 ## Testing
 
@@ -259,7 +287,7 @@ A bot token is a **credential**: whoever can post into a served channel can driv
 node tests/run.mjs
 ```
 
-62 tests, no network required: the suite drives the plugin's `apply` against a local mock Web API server and a scripted fake websocket — reply delivery (threaded), reaction acks, echo guard, queueing, /new, /stop, /pair enrollment persistence, unauthorized gating, teardown, Socket Mode ack/reconnect/abort behavior, config validation, mrkdwn escaping, chunk splitting, and the Web API client (error mapping, 429 Retry-After header).
+104 tests, no network required: the suite drives the plugin's `apply` against a local mock Web API server and a scripted fake websocket — reply delivery (threaded), reaction acks, echo guard, queueing, /new, /stop, /pair enrollment persistence, unauthorized gating, teardown, Socket Mode ack/reconnect/abort behavior, interactive-prompt delivery and every way one settles (button, text command, downstream answerer, deadline, abort), config validation, mrkdwn escaping, chunk splitting, and the Web API client (error mapping, 429 Retry-After header).
 
 There is also a live smoke test without an LLM: `node smoke.mjs` mounts the plugin with a stub echo agent against your real workspace (tokens from `.env.local`, gitignored) — post a message, get `echo: <text>` in-thread.
 
@@ -267,9 +295,10 @@ There is also a live smoke test without an LLM: `node smoke.mjs` mounts the plug
 
 - **Text only** — attachments, blocks, and mentions in the incoming message are ignored (only `text` is forwarded); replies are mrkdwn text.
 - **Socket Mode only** — no Events API webhook mode; the plugin holds a websocket in-process.
-- **No slash-command integration** — commands are plain chat text ("/new"); Slack's interactivity/slash-command payloads are acked and ignored.
+- **No slash-command integration** — commands are plain chat text ("!new"); Slack's slash-command payloads are acked and ignored (Block Kit *button* clicks are handled).
 - **One turn per channel at a time** — concurrent messages queue; they are not steering.
-- **Approval questions** are not surfaced on Slack; mount this plugin in a composition whose policy does not require interactive approval.
+- **Prompts are answered by whoever can post in the channel** — the buttons inherit the channel's trust model (anyone who can drive the agent can also approve its requests). Restrict the channel and the `permissionPreset` rather than relying on the prompt.
+- **A prompt is one message** — a question batch with more options than Slack renders as buttons falls back to a compact `!answer <text>` prompt, and a prompt that Slack rejects (message too large, channel archived) fails closed immediately.
 - **Agents can ping each other** — every message that mentions the bot is answered with a mention of its author, and messages from other apps are served. In a channel where several agent apps all reply to each other, that can sustain a conversation between them. The plugin answers one turn per channel and only when a message arrives, so it is not a runaway loop by itself, but a channel like that is worth watching for cost. An agent's own mentions reach Slack only for ids in `mentionUserIds`, so keep that list to the participants that should be addressable. Gate it further by only forwarding messages that mention the bot, or by skipping `bot_message` senders in `mentionBackTarget`. Also note that a channel where the bot is present is served *whether or not* the bot is mentioned (`allowAllChannels`, or a listed channel): mention-back is not mention-gating.
 
 ## Files
@@ -280,11 +309,12 @@ cordis.patch.yml        ready-made --patch overlay with a hardened example confi
 smoke.mjs               live smoke test: echo agent on your real workspace (reads .env.local)
 src/index.js            entry: name / inject / Config / apply — socket loop wiring, commands, reply path
 src/schema.js           Standard Schema v1 config validator (inline, no deps)
-src/slack.js            Web API client: call / openConnections / postMessage / reactions, splitMessage
-src/socket.js           Socket Mode loop: fresh-URL reconnect, envelope acks, event routing
+src/slack.js            Web API client: call / openConnections / postMessage / updateMessage / reactions, splitMessage
+src/socket.js           Socket Mode loop: fresh-URL reconnect, envelope acks, event + interactive routing
+src/interactions.js     Slack-side answering for approval/request and user-questions/request (buttons, deadline)
 src/format.js           markdown → Slack mrkdwn (escaped angle brackets, allowlisted mentions restored, fences preserved)
 src/message.js          frozen user-message factory (dsh-llm createUserMessage shape)
 src/collector.js        per-turn reply collector (last/all)
 src/sessions.js         per-channel agent manager (create/resume, state file, enrollments)
-tests/                  52-test suite + mock Web API + fake websocket (node tests/run.mjs)
+tests/                  104-test suite + mock Web API + fake websocket (node tests/run.mjs)
 ```

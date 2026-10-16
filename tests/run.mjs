@@ -10,8 +10,10 @@ for (const file of [
   'slack.spec.mjs',
   'socket.spec.mjs',
   'sessions.spec.mjs',
+  'interactions.spec.mjs',
   'plugin.spec.mjs',
   'plugin-flow.spec.mjs',
+  'interactive.spec.mjs',
 ]) {
   process.stdout.write('\n== ' + file + ' ==\n')
   await import('./' + file)

@@ -68,6 +68,67 @@ test('hello frames are tolerated and unknown types ignored', async () => {
   }
 })
 
+test('interactive envelopes are acked and routed to the interactive handler', async () => {
+  const mock = await startMockSlack()
+  try {
+    const client = new SlackClient({ apiBase: mock.url, botToken: 'xoxb-t', appToken: 'xapp-t' })
+    const socket = new FakeSlackSocket()
+    const events = []
+    const clicked = []
+    const logged = []
+    const controller = new AbortController()
+    const loop = runSocketLoop({
+      slack: client,
+      onEvent: (event) => events.push(event),
+      onInteractive: (payload) => { clicked.push(payload) },
+      signal: controller.signal,
+      logger: loggerOf(logged),
+      retryDelayMs: 10,
+      wsFactory: async () => socket,
+    })
+    await waitFor(() => socket.listeners.message?.length > 0)
+    socket.receive({ envelope_id: 'i-1', type: 'interactive', payload: { type: 'block_actions', actions: [{ action_id: 'a' }] } })
+    await sleep(30)
+    equal(clicked, [{ type: 'block_actions', actions: [{ action_id: 'a' }] }], 'interactive payload routed')
+    equal(events, [], 'interactive frames are not events')
+    equal(socket.sent, [{ envelope_id: 'i-1' }], 'envelope acked')
+    controller.abort()
+    socket.close()
+    await loop
+    equal(logged, [], 'nothing logged for a handled click')
+  } finally {
+    await mock.close()
+  }
+})
+
+test('a rejected interactive handler is contained and logged', async () => {
+  const mock = await startMockSlack()
+  try {
+    const client = new SlackClient({ apiBase: mock.url, botToken: 'xoxb-t', appToken: 'xapp-t' })
+    const socket = new FakeSlackSocket()
+    const logged = []
+    const controller = new AbortController()
+    const loop = runSocketLoop({
+      slack: client,
+      onEvent: () => {},
+      onInteractive: () => Promise.reject(new Error('click blew up')),
+      signal: controller.signal,
+      logger: loggerOf(logged),
+      retryDelayMs: 10,
+      wsFactory: async () => socket,
+    })
+    await waitFor(() => socket.listeners.message?.length > 0)
+    socket.receive({ envelope_id: 'i-2', type: 'interactive', payload: { type: 'block_actions' } })
+    await waitFor(() => logged.length > 0)
+    assert(logged[0].includes('click blew up'), 'the failure is reported: ' + logged[0])
+    controller.abort()
+    socket.close()
+    await loop
+  } finally {
+    await mock.close()
+  }
+})
+
 test('socket close triggers reconnect with a fresh URL', async () => {
   const mock = await startMockSlack()
   try {

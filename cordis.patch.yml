@@ -9,9 +9,11 @@
 # install the plugin into a profile with `dsh plugin add` and reference it by
 # package name.
 #
-# Slack app prerequisites: Socket Mode enabled, bot events message.channels /
-# message.groups / message.im subscribed, scopes chat:write + history +
-# reactions:write, bot invited to the target channels.
+# Slack app prerequisites: Socket Mode enabled, Interactivity enabled (the
+# approval/question buttons; the !allow / !deny / !answer text fallbacks work
+# without it), bot events message.channels / message.groups / message.im
+# subscribed, scopes chat:write + history + reactions:write, bot invited to
+# the target channels.
 #
 # Security: the allowlist below denies every channel by default. A bot token
 # is a credential — whoever can post into a served channel can drive a full
@@ -61,6 +63,12 @@
         #                          # (DMs are never gated); gated messages are
         #                          # kept and handed to the next addressed turn
         # contextMessages: 20      # how many unseen messages that turn carries
+        # How long an interactive prompt waits in the channel. Approvals and
+        # ask_user_question calls are posted with buttons; whatever nobody
+        # answers is settled at this deadline (an approval fails closed, a
+        # question reports the timeout to the model), so a channel is never
+        # left blocked. 0 waits until the turn is stopped instead.
+        # interactiveTimeoutMs: 1800000   # 30 minutes
         # Mentions the agent's own text may turn into a real Slack mention.
         # Reply text is escaped (nothing can become a link or a ping by
         # accident), which also escapes "<@U...>": only ids listed here come
