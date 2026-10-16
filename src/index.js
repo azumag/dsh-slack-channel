@@ -33,7 +33,7 @@ export const inject = ['agents']
 const HELP_TEXT = [
   'DeepSeek Harness agent channel.',
   'Commands (prefer the ! prefix — Slack intercepts leading / as its own slash commands):',
-  '!new — start a fresh session (clears channel memory)',
+  '!new — start a fresh session (clears this conversation\'s memory)',
   '!stop — cancel the running turn',
   '!allow / !deny — answer the approval prompt this channel is waiting on',
   '!answer <text> — answer the question prompt in your own words',
@@ -149,6 +149,23 @@ export function apply(ctx, config) {
   }
 
   /**
+   * The Slack thread a message belongs to: its parent for a reply, itself for
+   * a top-level message. Replies and notices always post under this root —
+   * Slack asks for the parent's ts, not a reply's.
+   */
+  function threadRootOf(event) {
+    return typeof event.thread_ts === 'string' && event.thread_ts.length > 0 && event.thread_ts !== event.ts ? event.thread_ts : event.ts
+  }
+
+  /**
+   * The conversation a message drives: the channel (sessionScope 'channel'),
+   * or one thread of it (sessionScope 'thread': "channel:root ts").
+   */
+  function conversationOf(channel, rootTs) {
+    return config.sessionScope === 'thread' ? channel + ':' + rootTs : channel
+  }
+
+  /**
    * Messages the agent has NOT seen, per channel, oldest first. With
    * mentionOnly on, a message that does not address the bot drives no turn —
    * but it is kept here and attached to the next turn that does, so the
@@ -232,9 +249,9 @@ export function apply(ctx, config) {
   }
 
   /** Submit one channel message to the agent as a fresh follow-up turn. */
-  function startTurn(record, text, eventTs, mentionUserId) {
+  function startTurn(record, text, eventTs, mentionUserId, threadTs) {
     record.busy = true
-    record.threadTs = eventTs
+    record.threadTs = threadTs ?? eventTs
     record.eventTs = eventTs
     /** The author to mention back in this turn's reply, when they used one. */
     record.mentionUserId = mentionUserId
@@ -252,7 +269,7 @@ export function apply(ctx, config) {
   async function drain(record) {
     if (record.busy || record.queue.length === 0) return
     const next = record.queue.shift()
-    startTurn(record, next.text, next.ts, next.mentionUserId)
+    startTurn(record, next.text, next.ts, next.mentionUserId, next.threadTs)
   }
 
   /** One turn ended: reduce collected texts to a reply and release the channel. */
@@ -367,6 +384,9 @@ export function apply(ctx, config) {
     const text = (event.text ?? '').trim()
     if (text.length === 0) return
     const command = asCommand(text)
+    const rootTs = threadRootOf(event)
+    const conversation = conversationOf(channel, rootTs)
+    const inThread = rootTs !== event.ts
 
     // Pairing is the one command an unauthorized channel may use: an
     // operator secret enrolls the channel without a host restart. A wrong
@@ -376,7 +396,7 @@ export function apply(ctx, config) {
     if (config.pairToken !== undefined && command !== undefined && /^pair(\s|$)/.test(command)) {
       if (text.slice(5).trim() === config.pairToken) {
         sessions.enroll(channel)
-        return sendReplyText(channel, event.ts, 'Paired — this channel is now authorized.')
+        return sendReplyText(channel, rootTs, 'Paired — this channel is now authorized.')
       }
     }
 
@@ -391,19 +411,24 @@ export function apply(ctx, config) {
       return
     }
 
-    if (command === 'start' || command === 'help') return sendReplyText(channel, event.ts, HELP_TEXT)
-    if (command === 'id' || command === 'channelid') return sendReplyText(channel, event.ts, channel)
+    if (command === 'start' || command === 'help') return sendReplyText(channel, rootTs, HELP_TEXT)
+    if (command === 'id' || command === 'channelid') return sendReplyText(channel, rootTs, channel)
     if (command === 'new') {
-      await sessions.get(channel, { fresh: true })
-      return sendReplyText(channel, event.ts, 'Started a fresh session.')
+      // Under sessionScope 'thread' every top-level message already opens its
+      // own session; !new resets the thread it is posted in.
+      if (config.sessionScope === 'thread' && inThread === false) {
+        return sendReplyText(channel, rootTs, 'Every new thread already starts its own session — post !new inside a thread to reset that thread.')
+      }
+      await sessions.get(conversation, { fresh: true, channel })
+      return sendReplyText(channel, rootTs, config.sessionScope === 'thread' ? 'Started a fresh session for this thread.' : 'Started a fresh session.')
     }
     if (command === 'stop') {
-      const record = sessions.record(channel)
-      if (record === undefined || record.busy !== true) return sendReplyText(channel, event.ts, 'Nothing is running.')
+      const record = sessions.record(conversation)
+      if (record === undefined || record.busy !== true) return sendReplyText(channel, rootTs, 'Nothing is running.')
       record.queue.length = 0
       record.collector?.clear()
       record.agent.cancel({ kind: 'user' })
-      return sendReplyText(channel, event.ts, 'Stop requested.')
+      return sendReplyText(channel, rootTs, 'Stop requested.')
     }
 
     // Interactive prompts are answered by the buttons on the prompt message;
@@ -412,37 +437,41 @@ export function apply(ctx, config) {
     // is waiting, so a typo is not silently swallowed.
     const verb = command === undefined ? undefined : command.split(/\s+/)[0]
     if (verb === 'allow' || verb === 'deny') {
-      if (interactions.answerFromText(channel, verb, '', event.user) === true) return
-      return sendReplyText(channel, event.ts, 'Nothing is waiting for approval.')
+      if (interactions.answerFromText(conversation, verb, '', event.user) === true) return
+      return sendReplyText(channel, rootTs, 'Nothing is waiting for approval.')
     }
     if (verb === 'answer') {
       const body = command.slice(verb.length).trim()
-      if (body.length === 0) return sendReplyText(channel, event.ts, 'Usage: !answer <text>')
-      if (interactions.answerFromText(channel, verb, body, event.user) === true) return
-      return sendReplyText(channel, event.ts, 'Nothing is waiting for an answer.')
+      if (body.length === 0) return sendReplyText(channel, rootTs, 'Usage: !answer <text>')
+      if (interactions.answerFromText(conversation, verb, body, event.user) === true) return
+      return sendReplyText(channel, rootTs, 'Nothing is waiting for an answer.')
     }
     // A plain message answers an option-less question prompt: there is nothing
     // to click for one, and the turn is blocked on it anyway. Every other
     // message keeps its ordinary meaning (gating below, then a turn or queue).
-    if (command === undefined && interactions.answerFromText(channel, undefined, text, event.user) === true) return
+    if (command === undefined && interactions.answerFromText(conversation, undefined, text, event.user) === true) return
 
     // Mention gating: with mentionOnly on, a channel message that does not
     // address the bot drives no turn — it is remembered instead, to be handed
     // to the next message that does. DMs are always addressed to the bot and
     // are never gated (a DM that required a mention would be unusable).
+    // Unseen messages are kept where the next addressed turn will read them:
+    // per thread for thread replies under sessionScope 'thread', per channel
+    // otherwise (a top-level mention opens a new thread and reads the channel).
+    const unseenKey = config.sessionScope === 'thread' && inThread ? conversation : channel
     if (config.mentionOnly === true && isSelfMention(text) === false && channel.startsWith('D') === false) {
-      rememberUnseen(channel, event, text)
+      rememberUnseen(unseenKey, event, text)
       return
     }
 
     let record
     try {
-      record = await sessions.get(channel)
+      record = await sessions.get(conversation, { channel })
     } catch (error) {
       // Most notably the single-owner rule: the mapped session is currently
       // open in another surface (the web UI). Say so instead of forking a
       // fresh session behind the user's back.
-      return sendReplyText(channel, event.ts, 'This session is currently open in the DSH web interface — close or leave it there, then post here again. (' + errorText(error) + ')')
+      return sendReplyText(channel, rootTs, 'This session is currently open in the DSH web interface — close or leave it there, then post here again. (' + errorText(error) + ')')
     }
     record.collector ??= createTurnCollector()
 
@@ -454,18 +483,18 @@ export function apply(ctx, config) {
 
     // A mention-driven turn opens with the messages the agent has not seen,
     // so answering "what do you think?" still knows what was discussed.
-    const unseen = isSelfMention(text) ? takeUnseenContext(channel) : undefined
+    const unseen = isSelfMention(text) ? takeUnseenContext(unseenKey) : undefined
     const prompt = unseen === undefined ? text : unseen + '\n\n' + text
 
     if (record.busy) {
-      record.queue.push({ text: prompt, ts: event.ts, mentionUserId: mentionBackTarget(event, text) })
+      record.queue.push({ text: prompt, ts: event.ts, threadTs: rootTs, mentionUserId: mentionBackTarget(event, text) })
       if (config.ackQueued === false) return
       // A queue behind a prompt is not the agent thinking: say what it waits
       // for, so a silent channel is never mistaken for a wedged one.
-      const waiting = interactions.hasPending(channel) ? ' Answer the prompt above to continue.' : ''
-      return sendReplyText(channel, event.ts, 'Queued (' + record.queue.length + ' pending).' + waiting)
+      const waiting = interactions.hasPending(conversation) ? ' Answer the prompt above to continue.' : ''
+      return sendReplyText(channel, rootTs, 'Queued (' + record.queue.length + ' pending).' + waiting)
     }
-    startTurn(record, prompt, event.ts, mentionBackTarget(event, text))
+    startTurn(record, prompt, event.ts, mentionBackTarget(event, text), rootTs)
   }
 
   /** Post a control/notice message (commands, acks) into a thread. */

@@ -1,6 +1,6 @@
 # dsh-slack-channel
 
-A Slack **channel** for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH): point a Slack bot at a DSH runtime and drive the agent from any Slack channel or DM. One live agent session per channel, replies posted back in-thread.
+A Slack **channel** for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH): point a Slack bot at a DSH runtime and drive the agent from any Slack channel or DM. One live agent session per channel — or per Slack thread with `sessionScope: thread` — replies posted back in-thread.
 
 Pure `fetch` + the platform `WebSocket` — no npm dependencies, no build step, Node ≥ 22. **Socket Mode needs no public URL** — the bot holds an outbound websocket, so it works behind NAT/firewalls.
 
@@ -192,9 +192,10 @@ the web interface.
 | `notifyUnauthorized` | `false` | Reply "not authorized" to rejected channels. |
 | `stateFile` | — | JSON file persisting channel → session ids and /pair enrollments. |
 | `pairToken` | — | Enables the enrollment flow (requires `stateFile`). |
+| `sessionScope` | `channel` | `channel`: one session per channel (threads share it). `thread`: one session per Slack thread — a top-level message opens a new session, replies in its thread continue it; queues, `!stop`, `!new`, prompts and unseen context stay inside the thread. |
 | `replyMode` | `last` | `last`: final assistant message of a turn; `all`: join every assistant message. |
 | `maxReplyChars` | `4000` | Split longer replies at line boundaries. |
-| `threadReplies` | `true` | Reply in-thread on the originating message. |
+| `threadReplies` | `true` | Reply in-thread under the originating message's thread root (a reply in a thread is answered in that same thread). |
 | `ackReaction` | `hourglass` | Emoji reaction marking the message being worked on (empty string disables). |
 | `mentionOnly` | `false` | Serve only messages that address the bot (or one of its commands). DMs are never gated. Messages that are gated become context, not silence — see below. |
 | `mentionUserIds` | `[]` | Slack user ids (`U…`) the agent's own text may turn into a real mention. Empty keeps every agent-written `<@U…>` as escaped text — see below. |
@@ -296,7 +297,7 @@ There is also a live smoke test without an LLM: `node smoke.mjs` mounts the plug
 - **Text only** — attachments, blocks, and mentions in the incoming message are ignored (only `text` is forwarded); replies are mrkdwn text.
 - **Socket Mode only** — no Events API webhook mode; the plugin holds a websocket in-process.
 - **No slash-command integration** — commands are plain chat text ("!new"); Slack's slash-command payloads are acked and ignored (Block Kit *button* clicks are handled).
-- **One turn per channel at a time** — concurrent messages queue; they are not steering.
+- **One turn per session at a time** — concurrent messages queue; they are not steering. With `sessionScope: thread` the unit is the thread, so other threads are not held up.
 - **Prompts are answered by whoever can post in the channel** — the buttons inherit the channel's trust model (anyone who can drive the agent can also approve its requests). Restrict the channel and the `permissionPreset` rather than relying on the prompt.
 - **A prompt is one message** — a question batch with more options than Slack renders as buttons falls back to a compact `!answer <text>` prompt, and a prompt that Slack rejects (message too large, channel archived) fails closed immediately.
 - **Agents can ping each other** — every message that mentions the bot is answered with a mention of its author, and messages from other apps are served. In a channel where several agent apps all reply to each other, that can sustain a conversation between them. The plugin answers one turn per channel and only when a message arrives, so it is not a runaway loop by itself, but a channel like that is worth watching for cost. An agent's own mentions reach Slack only for ids in `mentionUserIds`, so keep that list to the participants that should be addressable. Gate it further by only forwarding messages that mention the bot, or by skipping `bot_message` senders in `mentionBackTarget`. Also note that a channel where the bot is present is served *whether or not* the bot is mentioned (`allowAllChannels`, or a listed channel): mention-back is not mention-gating.

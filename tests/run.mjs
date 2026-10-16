@@ -14,6 +14,7 @@ for (const file of [
   'plugin.spec.mjs',
   'plugin-flow.spec.mjs',
   'interactive.spec.mjs',
+  'thread-scope.spec.mjs',
 ]) {
   process.stdout.write('\n== ' + file + ' ==\n')
   await import('./' + file)

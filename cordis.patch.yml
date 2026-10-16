@@ -54,6 +54,10 @@
         # Enrollment flow alternative to editing this file: set a one-time
         # secret, then post "/pair <secret>" in the target channel.
         # pairToken: change-me-before-use
+        # One session per channel (default) or per Slack thread: with 'thread'
+        # a top-level message opens a new session and replies in its thread
+        # continue it.
+        # sessionScope: channel
         # UX knobs (defaults shown):
         # replyMode: last          # send the final assistant message of a turn
         # threadReplies: true      # reply in-thread on the originating message

@@ -9,6 +9,9 @@ import { isAbsolute } from 'node:path'
 
 const REPLY_MODES = ['last', 'all']
 
+/** What one agent session spans: a whole channel, or one Slack thread. */
+const SESSION_SCOPES = ['channel', 'thread']
+
 /** Hard cap on the context block, whatever the config asks for. */
 const CONTEXT_MESSAGES_MAX = 200
 
@@ -28,6 +31,7 @@ const DEFAULTS = Object.freeze({
   socketRetryDelayMs: 2000,
   maxReplyChars: 4000,
   replyMode: 'last',
+  sessionScope: 'channel',
   threadReplies: true,
   ackReaction: 'hourglass',
   notifyUnauthorized: false,
@@ -176,6 +180,14 @@ function validate(input) {
   cfg.replyMode = REPLY_MODES.includes(src.replyMode) ? src.replyMode : DEFAULTS.replyMode
   if (src.replyMode !== undefined && !REPLY_MODES.includes(src.replyMode)) {
     issues.push({ message: 'replyMode must be one of ' + REPLY_MODES.join('|') })
+  }
+
+  // Session scope: 'channel' keeps one session per channel (threads share
+  // it); 'thread' gives every Slack thread its own session — a top-level
+  // message opens a new one, replies in its thread continue it.
+  cfg.sessionScope = SESSION_SCOPES.includes(src.sessionScope) ? src.sessionScope : DEFAULTS.sessionScope
+  if (src.sessionScope !== undefined && !SESSION_SCOPES.includes(src.sessionScope)) {
+    issues.push({ message: 'sessionScope must be one of ' + SESSION_SCOPES.join('|') })
   }
 
   // UX toggles.

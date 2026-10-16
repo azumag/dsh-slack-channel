@@ -1,8 +1,10 @@
-// Per-chat agent session management: one live agent (own session) per
-// Telegram chat, created through ctx.agents the same way the in-repo ACP
-// bridge creates its sessions. Optional state-file persistence records the
-// chat-to-session mapping so a restart resumes conversations instead of
-// silently starting over.
+// Per-conversation agent session management: one live agent (own session)
+// per conversation key, created through ctx.agents the same way the in-repo
+// ACP bridge creates its sessions. The key is the Slack channel id
+// (sessionScope: channel) or "channel:thread root ts" (sessionScope: thread);
+// each record also carries its Slack channel id (chatId) for posting. Optional
+// state-file persistence records the key-to-session mapping so a restart
+// resumes conversations instead of silently starting over.
 
 import { randomUUID } from 'node:crypto'
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
@@ -110,7 +112,7 @@ export function createChatSessions({ ctx, config, logger }) {
     }
   }
 
-  async function create(chatId, resumeSessionId) {
+  async function create(key, chatId, resumeSessionId) {
     // Channel-scoped workspace first (the Slack-section ↔ DSH-workspace
     // mapping), then the plugin-wide workspace, then the server's cwd.
     const cwd = config.channelCwd?.[String(chatId)] ?? config.cwd ?? process.cwd()
@@ -160,6 +162,9 @@ export function createChatSessions({ ctx, config, logger }) {
       applyPermissionPreset(handle)
     }
     return {
+      /** The conversation key (channel, or channel:thread root). */
+      key,
+      /** The Slack channel id the conversation lives in. */
       chatId,
       agent: handle.agent,
       dispose: handle.dispose,
@@ -177,11 +182,14 @@ export function createChatSessions({ ctx, config, logger }) {
   }
 
   /**
-   * Return the live record for a chat, creating (or resuming) one on first
-   * use. fresh=true disposes the previous record first (the /new command).
+   * Return the live record for a conversation, creating (or resuming) one on
+   * first use. fresh=true disposes the previous record first (the /new
+   * command). `channel` is the Slack channel id when the key is a thread key;
+   * a plain channel key is its own channel.
    */
-  async function get(chatId, { fresh = false } = {}) {
-    const key = String(chatId)
+  async function get(conversation, { fresh = false, channel } = {}) {
+    const key = String(conversation)
+    const chatId = channel ?? key
     if (fresh === false) {
       const existing = byChat.get(key)
       if (existing !== undefined) return existing
@@ -198,7 +206,7 @@ export function createChatSessions({ ctx, config, logger }) {
       }
     }
     const known = fresh === true ? undefined : state.chats[key]?.sessionId
-    const record = await create(chatId, known)
+    const record = await create(key, chatId, known)
     byChat.set(key, record)
     bySession.set(record.agent.session.id, record)
     state.chats[key] = { sessionId: record.agent.session.id, updatedAt: new Date().toISOString() }
@@ -211,9 +219,9 @@ export function createChatSessions({ ctx, config, logger }) {
     return bySession.get(sessionId)
   }
 
-  /** The record for a chat id, if one is live. */
-  function record(chatId) {
-    return byChat.get(String(chatId))
+  /** The record for a conversation key, if one is live. */
+  function record(conversation) {
+    return byChat.get(String(conversation))
   }
 
   function stopTyping(record) {

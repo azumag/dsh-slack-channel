@@ -72,7 +72,12 @@ export function humanDuration(ms) {
 export function createInteractions({ config, logger, slack, sessions, authorized, mrkdwnOptions }) {
   /** id → entry, for button clicks. */
   const pending = new Map()
-  /** channel id → insertion-ordered ids, for text answers and lookups. */
+  /**
+   * Session scope → insertion-ordered ids, for text answers and lookups. The
+   * scope is the record's key: the channel id (sessionScope: channel) or
+   * "channel:thread root ts" (sessionScope: thread), so a prompt is answered
+   * from the conversation that owns it.
+   */
   const byChannel = new Map()
   /** The configured deadline; 0 waits forever (only !stop ends a prompt). */
   const timeoutMs = config.interactiveTimeoutMs
@@ -105,20 +110,20 @@ export function createInteractions({ config, logger, slack, sessions, authorized
 
   function track(entry) {
     pending.set(entry.id, entry)
-    let ids = byChannel.get(entry.channel)
+    let ids = byChannel.get(entry.scope)
     if (ids === undefined) {
       ids = new Set()
-      byChannel.set(entry.channel, ids)
+      byChannel.set(entry.scope, ids)
     }
     ids.add(entry.id)
   }
 
   function untrack(entry) {
     pending.delete(entry.id)
-    const ids = byChannel.get(entry.channel)
+    const ids = byChannel.get(entry.scope)
     if (ids === undefined) return
     ids.delete(entry.id)
-    if (ids.size === 0) byChannel.delete(entry.channel)
+    if (ids.size === 0) byChannel.delete(entry.scope)
   }
 
   /** Serialize this prompt's Slack writes so the last rendered state wins. */
@@ -253,6 +258,7 @@ export function createInteractions({ config, logger, slack, sessions, authorized
     const entry = newEntry({
       kind: 'approval',
       channel: record.chatId,
+      scope: record.key ?? String(record.chatId),
       threadTs: threadOf(record),
       request,
     })
@@ -286,6 +292,7 @@ export function createInteractions({ config, logger, slack, sessions, authorized
     const entry = newEntry({
       kind: 'question',
       channel: record.chatId,
+      scope: record.key ?? String(record.chatId),
       threadTs: threadOf(record),
       questions: normalizeQuestions(request.questions),
       /** question id → committed answer item. */
