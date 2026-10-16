@@ -58,9 +58,30 @@ export async function waitFor(fn, timeoutMs = 4000, stepMs = 20) {
 }
 
 /**
+ * The first Block Kit rule a payload breaks that real Slack enforces, or
+ * undefined. Slack requires every action_id to be unique within its
+ * containing block and refuses the whole message otherwise — the mock does
+ * too, so a prompt that would never reach a real channel fails here.
+ */
+export function blockKitViolation(blocks) {
+  if (!Array.isArray(blocks)) return undefined
+  for (const block of blocks) {
+    const seen = new Set()
+    for (const element of block?.elements ?? []) {
+      const actionId = element?.action_id
+      if (typeof actionId !== 'string') continue
+      if (seen.has(actionId)) return 'duplicate action_id ' + actionId + ' in block ' + (block.block_id ?? '?')
+      seen.add(actionId)
+    }
+  }
+  return undefined
+}
+
+/**
  * Start one mock Slack Web API server. Records every call (method, token
  * kind, body); serves canned responses per method; supports per-test
- * overrides. apps.connections.open only succeeds for xapp- tokens.
+ * overrides. apps.connections.open only succeeds for xapp- tokens; message
+ * writes with invalid blocks fail with invalid_blocks, as on real Slack.
  */
 export async function startMockSlack() {
   const calls = []
@@ -83,6 +104,8 @@ export async function startMockSlack() {
         if (method === 'apps.connections.open') {
           if (token.startsWith('xapp-')) reply = { ok: true, url: 'wss://mock-socket/' + calls.length }
           else reply = { ok: false, error: 'invalid_auth' }
+        } else if ((method === 'chat.postMessage' || method === 'chat.update') && blockKitViolation(body.blocks) !== undefined) {
+          reply = { ok: false, error: 'invalid_blocks', errors: [blockKitViolation(body.blocks)] }
         } else if (method === 'chat.postMessage') {
           postTs += 1
           reply = { ok: true, channel: body.channel, ts: postTs + '.001' }

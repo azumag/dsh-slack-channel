@@ -9,7 +9,9 @@ import {
   ACTION_QUESTION_OPTION,
   ACTION_QUESTION_SUBMIT,
   createInteractions,
+  isQuestionOptionAction,
 } from '../src/interactions.js'
+import { blockKitViolation } from './_util.mjs'
 
 const NEVER = () => new Promise(() => {})
 
@@ -234,14 +236,14 @@ test('question: option buttons answer the batch', async () => {
   const pending = h.interactions.answerQuestion(request, NEVER)
   await waitFor(() => h.posts().length === 1)
   const blocks = h.posts()[0].options.blocks
-  const options = blocks.flatMap((block) => block.elements ?? []).filter((element) => element.action_id === ACTION_QUESTION_OPTION)
+  const options = blocks.flatMap((block) => block.elements ?? []).filter((element) => isQuestionOptionAction(element.action_id))
   equal(options.length, 3, 'one button per option')
   assert(blocks[0].text.text.includes('2 question'), 'the prompt counts the questions')
 
-  await h.interactions.handleInteractive(click('C42', ACTION_QUESTION_OPTION, options[0].value))
+  await h.interactions.handleInteractive(click('C42', options[0].action_id, options[0].value))
   await sleep(40)
   assert(h.updates().length >= 1, 'a partial answer re-renders the prompt')
-  await h.interactions.handleInteractive(click('C42', ACTION_QUESTION_OPTION, options[2].value))
+  await h.interactions.handleInteractive(click('C42', options[2].action_id, options[2].value))
   const answer = await pending
   equal(answer.answers, [
     { id: 'a', selected: ['Yes'] },
@@ -258,14 +260,14 @@ test('question: a multi-select question toggles and commits on Submit', async ()
   const pending = h.interactions.answerQuestion(request, NEVER)
   await waitFor(() => h.posts().length === 1)
   const buttons = h.posts()[0].options.blocks.flatMap((block) => block.elements ?? [])
-  await h.interactions.handleInteractive(click('C42', ACTION_QUESTION_OPTION, buttons[0].value))
-  await h.interactions.handleInteractive(click('C42', ACTION_QUESTION_OPTION, buttons[1].value))
+  await h.interactions.handleInteractive(click('C42', buttons[0].action_id, buttons[0].value))
+  await h.interactions.handleInteractive(click('C42', buttons[1].action_id, buttons[1].value))
   await waitFor(() => h.updates().length >= 1)
   const afterToggle = h.updates()[h.updates().length - 1].options.blocks.flatMap((block) => block.elements ?? [])
   const submit = afterToggle.find((element) => element.action_id === ACTION_QUESTION_SUBMIT)
   assert(submit !== undefined, 'Submit appears once something is selected')
   // Toggling one back off removes it again.
-  await h.interactions.handleInteractive(click('C42', ACTION_QUESTION_OPTION, buttons[0].value))
+  await h.interactions.handleInteractive(click('C42', buttons[0].action_id, buttons[0].value))
   await h.interactions.handleInteractive(click('C42', ACTION_QUESTION_SUBMIT, submit.value))
   const answer = await pending
   equal(answer.answers, [{ id: 'a', selected: ['two'] }], 'Submit commits the remaining selection')
@@ -430,4 +432,77 @@ test('a click on a settled prompt changes nothing', async () => {
   await h.interactions.handleInteractive(click('C42', ACTION_APPROVAL_DENY, allow.value))
   await sleep(40)
   equal(h.updates().length, 1, 'the late click is ignored')
+})
+
+test('every prompt keeps action ids unique within each actions block', async () => {
+  const h = mount()
+  const { agent, record } = owned()
+  h.records.set(agent.session.id, record)
+  const approval = h.interactions.answerApproval({ agent, toolName: 'bash' }, NEVER)
+  const options = ['a', 'b', 'c', 'd', 'e', 'f', 'g'].map((label) => ({ label }))
+  const question = h.interactions.answerQuestion({
+    agent,
+    questions: [
+      { id: 'single', question: 'Pick one', options },
+      { id: 'multi', question: 'Pick some', multiSelect: true, options: options.slice(0, 4) },
+    ],
+  }, NEVER)
+  await waitFor(() => h.posts().length === 2)
+  for (const post of h.posts()) equal(blockKitViolation(post.options.blocks), undefined, 'Slack would accept the prompt')
+
+  const multi = h.posts()[1].options.blocks.flatMap((block) => block.elements ?? []).filter((element) => element.value.includes('"q":"multi"'))
+  await h.interactions.handleInteractive(click('C42', multi[0].action_id, multi[0].value))
+  await waitFor(() => h.updates().length >= 1)
+  const withSubmit = h.updates()[h.updates().length - 1].options.blocks
+  assert(button(withSubmit, ACTION_QUESTION_SUBMIT) !== undefined, 'the toggle shows Submit')
+  equal(blockKitViolation(withSubmit), undefined, 'the re-render with Submit stays valid')
+
+  equal(h.interactions.answerFromText('C42', 'deny', '', 'U1'), true)
+  equal(await approval, 'rejected')
+  equal(h.interactions.answerFromText('C42', 'answer', 'skip', 'U1'), true)
+  equal(h.interactions.answerFromText('C42', 'answer', 'skip', 'U1'), true)
+  await question
+})
+
+test('question: option descriptions and long labels are spelled out above the buttons', async () => {
+  const h = mount()
+  const { agent, record } = owned()
+  h.records.set(agent.session.id, record)
+  const pending = h.interactions.answerQuestion({
+    agent,
+    questions: [{
+      id: 'next',
+      question: 'How should we proceed?',
+      options: [
+        { label: 'Rerun diagnostics after 03:18 (Recommended)', description: 'Creates one workflow run; no production change.' },
+        { label: 'Report only' },
+      ],
+    }],
+  }, NEVER)
+  await waitFor(() => h.posts().length === 1)
+  const blocks = h.posts()[0].options.blocks
+  const section = blocks.find((block) => block.block_id === 'dsh-q-0').text.text
+  assert(section.includes('• Rerun diagnostics after 03:18 (Recommended) — Creates one workflow run; no production change.'), 'the description reaches Slack: ' + section)
+  assert(section.includes('• Report only'), 'every option is listed')
+  const footer = blocks[blocks.length - 1].text.text
+  assert(footer.startsWith('_Use'), 'the footer italic opens without a space: ' + footer)
+
+  const short = h.interactions.answerQuestion({ agent, questions: [{ id: 'yn', question: 'Deploy?', options: [{ label: 'Yes' }, { label: 'No' }] }] }, NEVER)
+  await waitFor(() => h.posts().length === 2)
+  const shortSection = h.posts()[1].options.blocks.find((block) => block.block_id === 'dsh-q-0').text.text
+  assert(shortSection.includes('•') === false, 'short labels without descriptions stay on the buttons alone')
+  h.interactions.disposeAll()
+  await pending.catch(() => {})
+  await short.catch(() => {})
+})
+
+test('a click carrying the bare option action id still answers', async () => {
+  const h = mount()
+  const { agent, record } = owned()
+  h.records.set(agent.session.id, record)
+  const pending = h.interactions.answerQuestion({ agent, questions: [{ id: 'a', question: 'Deploy?', options: [{ label: 'Yes' }, { label: 'No' }] }] }, NEVER)
+  await waitFor(() => h.posts().length === 1)
+  const no = h.posts()[0].options.blocks.flatMap((block) => block.elements ?? []).filter((element) => isQuestionOptionAction(element.action_id))[1]
+  await h.interactions.handleInteractive(click('C42', ACTION_QUESTION_OPTION, no.value))
+  equal((await pending).answers, [{ id: 'a', selected: ['No'] }])
 })

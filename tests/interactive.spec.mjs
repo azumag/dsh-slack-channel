@@ -5,9 +5,9 @@
 // this suite exists for is a prompt that held the turn (and every later
 // message) until the host restarted.
 
-import { test, assert, equal, startMockSlack, sleep, waitFor, FakeSlackSocket } from './_util.mjs'
+import { test, assert, equal, startMockSlack, sleep, waitFor, FakeSlackSocket, blockKitViolation } from './_util.mjs'
 import { apply, Config } from '../src/index.js'
-import { ACTION_APPROVAL_ALLOW, ACTION_QUESTION_OPTION } from '../src/interactions.js'
+import { ACTION_APPROVAL_ALLOW, isQuestionOptionAction } from '../src/interactions.js'
 
 class FakeAgent {
   constructor(id) {
@@ -201,14 +201,52 @@ test('a question prompt is answered by its option buttons', async () => {
       questions: [{ id: 'a', header: 'Confirm', question: 'Deploy?', options: [{ label: 'Yes' }, { label: 'No' }] }],
     }, NEVER)
     const prompt = await waitFor(() => h.sent().find((body) => Array.isArray(body.blocks)))
-    const yes = prompt.blocks.flatMap((block) => block.elements ?? []).find((element) => element.action_id === ACTION_QUESTION_OPTION)
+    const yes = prompt.blocks.flatMap((block) => block.elements ?? []).find((element) => isQuestionOptionAction(element.action_id))
     h.pushInteractive({
       type: 'block_actions',
       channel: { id: 'C42' },
       user: { id: 'U1' },
-      actions: [{ action_id: ACTION_QUESTION_OPTION, value: yes.value }],
+      actions: [{ action_id: yes.action_id, value: yes.value }],
     })
     equal((await answer).answers, [{ id: 'a', selected: ['Yes'] }], 'the button answers the batch')
+    await h.dispose()
+  } finally {
+    await mock.close()
+  }
+})
+
+// The batch DSH asked on 2026-10-17 03:06 JST, which Slack refused because
+// all four option buttons shared one action_id.
+test('a four-option question with descriptions reaches Slack and is answered', async () => {
+  const mock = await startMockSlack()
+  try {
+    const h = await mount(mock)
+    const agent = await startSession(h)
+    const answer = h.waterfall('user-questions/request', {
+      agent,
+      questions: [{
+        id: 'next_step',
+        header: '次の一手',
+        question: '現時点（03:05 JST）では次スロット（03:18）前のため判定できません。どう進めますか？',
+        options: [
+          { label: '03:18以降に read-only diagnostics を再実行する（推奨）', description: 'workflow run は1件作成（本番変更なし）。' },
+          { label: '報告のみでよい（追加実行しない）', description: '再実行はオーナーが行います。' },
+          { label: '未マージ2ブランチの調査を先に進める', description: '差分を read-only で調べます。' },
+          { label: 'handoff.md に本検証結果を追記する', description: '実測値・未確認事項を追記します。' },
+        ],
+      }],
+    }, NEVER)
+    const prompt = await waitFor(() => h.sent().find((body) => Array.isArray(body.blocks)))
+    equal(blockKitViolation(prompt.blocks), undefined, 'Slack accepts the prompt')
+    const buttons = prompt.blocks.flatMap((block) => block.elements ?? []).filter((element) => isQuestionOptionAction(element.action_id))
+    equal(buttons.length, 4, 'one button per option')
+    h.pushInteractive({
+      type: 'block_actions',
+      channel: { id: 'C42' },
+      user: { id: 'U1' },
+      actions: [{ action_id: buttons[2].action_id, value: buttons[2].value }],
+    })
+    equal((await answer).answers, [{ id: 'next_step', selected: ['未マージ2ブランチの調査を先に進める'] }], 'the third button answers')
     await h.dispose()
   } finally {
     await mock.close()

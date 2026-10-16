@@ -16,19 +16,36 @@
 import { randomUUID } from 'node:crypto'
 import { toSlackMrkdwn } from './format.js'
 
-/** Button action ids; handleInteractive routes on exactly these strings. */
+/**
+ * Button action ids; handleInteractive routes on these strings. Slack refuses
+ * a message whose actions block repeats an action_id, so option buttons carry
+ * their index (`dsh-slack-option-2`) and are routed by prefix.
+ */
 export const ACTION_APPROVAL_ALLOW = 'dsh-slack-allow'
 export const ACTION_APPROVAL_DENY = 'dsh-slack-deny'
 export const ACTION_QUESTION_OPTION = 'dsh-slack-option'
 export const ACTION_QUESTION_SUBMIT = 'dsh-slack-submit'
+
+/** The action id of one option button. */
+export function questionOptionActionId(optionIndex) {
+  return ACTION_QUESTION_OPTION + '-' + optionIndex
+}
+
+/** Whether an action id belongs to an option button (bare id kept for old prompts). */
+export function isQuestionOptionAction(actionId) {
+  return actionId === ACTION_QUESTION_OPTION || (typeof actionId === 'string' && actionId.startsWith(ACTION_QUESTION_OPTION + '-'))
+}
 
 /** Slack caps: blocks per message, elements per actions block, field lengths. */
 const BLOCKS_MAX = 50
 const BUTTONS_PER_ROW = 5
 const SECTION_TEXT_MAX = 2900
 const BUTTON_LABEL_MAX = 75
+/** Slack may cut button text at about this many characters. */
+const BUTTON_LABEL_VISIBLE = 30
 const REASON_MAX = 1500
 const DETAIL_MAX = 800
+const OPTION_DESCRIPTION_MAX = 300
 const FALLBACK_TEXT_MAX = 400
 
 /** A promise that never settles, for "this racer has nothing to say yet". */
@@ -431,7 +448,7 @@ export function createInteractions({ config, logger, slack, sessions, authorized
       if (entry.channel !== channel) continue
       if (action.action_id === ACTION_APPROVAL_ALLOW) conclude(entry, { outcome: 'allowed-once', actorId })
       else if (action.action_id === ACTION_APPROVAL_DENY) conclude(entry, { outcome: 'rejected', actorId })
-      else if (action.action_id === ACTION_QUESTION_OPTION) clickOption(entry, value, actorId)
+      else if (isQuestionOptionAction(action.action_id)) clickOption(entry, value, actorId)
       else if (action.action_id === ACTION_QUESTION_SUBMIT) clickSubmit(entry, value, actorId)
     }
   }
@@ -531,6 +548,15 @@ export function createInteractions({ config, logger, slack, sessions, authorized
     if (question.header.length > 0) lines.push('*' + escape(question.header) + '*')
     lines.push(escape(question.question))
     if (question.detail.length > 0) lines.push('_' + escape(clip(question.detail, DETAIL_MAX)) + '_')
+    // Slack cuts button text short and has no room for an option's
+    // description, which can carry what choosing it does; spell them out.
+    const options = question.options ?? []
+    if (options.some((option) => option.description.length > 0 || option.label.length > BUTTON_LABEL_VISIBLE)) {
+      for (const option of options) {
+        const description = option.description.length > 0 ? ' — ' + clip(option.description, OPTION_DESCRIPTION_MAX) : ''
+        lines.push(escape('• ' + option.label + description))
+      }
+    }
     if (answer !== undefined) {
       const shown = answer.custom !== undefined ? answer.custom : answer.selected.join(', ')
       lines.push('→ ' + (shown.length > 0 ? '✅ ' + escape(shown) : '_skipped_'))
@@ -545,7 +571,7 @@ export function createInteractions({ config, logger, slack, sessions, authorized
     const chosen = new Set(entry.selecting.get(question.id) ?? answer?.selected ?? [])
     const elements = (question.options ?? []).map((option, optionIndex) => ({
       type: 'button',
-      action_id: ACTION_QUESTION_OPTION,
+      action_id: questionOptionActionId(optionIndex),
       value: JSON.stringify({ p: entry.id, q: question.id, i: optionIndex }),
       text: { type: 'plain_text', text: (chosen.has(option.label) ? '✅ ' : '') + clip(option.label, BUTTON_LABEL_MAX - 2) },
     }))
@@ -569,7 +595,8 @@ export function createInteractions({ config, logger, slack, sessions, authorized
     const freeForm = entry.questions.some((question) => (question.options?.length ?? 0) === 0)
     const hint = freeForm ? ' Reply in this channel (or `!answer <text>`) to answer in your own words.' : ' Use `!answer <text>` for an answer that is not listed.'
     const expiry = timeoutMs > 0 ? ' Expires in ' + humanDuration(timeoutMs) + '.' : ' Waits until the turn is stopped.'
-    return '_' + hint + expiry + '_'
+    // No space after the opening underscore, or Slack shows it literally.
+    return '_' + (hint + expiry).trim() + '_'
   }
 
   /** One compact fallback prompt (too many questions to render as buttons). */
@@ -659,7 +686,7 @@ export function createInteractions({ config, logger, slack, sessions, authorized
       multiSelect: question?.multiSelect === true,
       options: (Array.isArray(question?.options) ? question.options : [])
         .filter((option) => typeof option?.label === 'string')
-        .map((option) => ({ label: option.label })),
+        .map((option) => ({ label: option.label, description: text(option.description) })),
     }))
   }
 
