@@ -98,6 +98,8 @@ GitHub のトークン（Mac の `~/.dsh/cordis.patch.yml` の MCP 行）は渡�
 ```text
 <@U0CCCH69XMW> 続きです。暗号化した秘密を渡します（あなたの VM の秘密鍵でしか開けません）。
 
+cd ~/dsh-slack-channel && git pull --ff-only
+~/dsh-slack-channel/deploy/linux/setup.sh install --reconfigure
 ~/dsh-slack-channel/deploy/linux/setup.sh import 'dsk-sealed1:…ここに貼る…'
 ~/dsh-slack-channel/deploy/linux/setup.sh check
 
@@ -128,6 +130,8 @@ check の出力をそのまま返信してください（秘密の値は出ま�
 ### bubblewrap を入れる（`✗ command sandbox` のときだけ。VM のシステムパッケージなので owner の OK を取ってから）
 
 Landlock はカーネル次第（無効なカーネルや、seccomp で止めるコンテナがある）。bubblewrap は Ubuntu の標準パッケージ。
+**注意:** Muse の VM は再プロビジョンで `/home/hatch` 以外が作り直される（2026-10-25 に判明）ので、apt で入れた bubblewrap も
+消える。Landlock が ✓ ならこの節は不要。
 
 ```text
 <@U0CCCH69XMW> DSH のボットがコマンドを実行するのにサンドボックス（bubblewrap）が要ります。owner の了承済みです。プロキシの環境変数が入ったシェルで、次を実行してください（root でなければ sudo -E を付けて）。
