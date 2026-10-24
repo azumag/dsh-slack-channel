@@ -254,7 +254,7 @@ Mac で有効なスケジュール（`~/.dsh/storages/schedule.json`）は、DSH
 ### 依頼文 3（起動）
 
 ```text
-<@U0CCCH69XMW> Mac 側の DSH の Slack 接続を止めました。VM のボットを起動してください（いつものプロキシの入ったシェルで）。
+<@U0CCCH69XMW> DSH ボットを VM に切り替えます。VM のボットを起動してください（いつものプロキシの入ったシェルで）。Mac 側の DSH は、VM の起動を確かめたらすぐに新しい受付を止めます（動いている作業は Mac で片付けます）。
 
 cd ~/dsh-slack-channel && git pull --ff-only
 ~/dsh-slack-channel/deploy/linux/setup.sh install
@@ -264,12 +264,12 @@ cd ~/dsh-slack-channel && git pull --ff-only
 install の最後の 10 行と、start --cutover・status の出力を返信してください。
 ```
 
-`install` は、VM が作り直されて消えたサービスを書き直し、プロキシ設定をこのシェルから写し直す（設定・秘密・入れた DSH・
-git の名義はそのまま）。Claude ボットの切り替えでは、サービスが消えていて最初の `start --cutover` が失敗した。
+`install` は、VM が作り直されて消えたサービスを書き直し、プロキシ設定を写し直す（/etc/environment のものが通ればそれ。
+設定・秘密・入れた DSH・git の名義はそのまま）。Claude ボットの切り替えでは、サービスが消えていて最初の `start --cutover` が失敗した。
 
 `start --cutover` の出力に `own identity resolved (bot_id=…, user_id=U0C9C7BNVB5)` が出れば Slack の Web API まで届いている。
 `socket connected (num_connections=N)` は Slack が Socket Mode の接続を受け付けた印で、N はこの Slack アプリへの接続数
-（Mac 側が切れていれば 1）。`socket connect failed` / `apps.connections.open failed` が出たら失敗。そのあと Slack で DSH に
+（Mac 側が切れていれば 1。受付だけ先に移す手順では、Mac がまだつながっているので 2）。`socket connect failed` / `apps.connections.open failed` が出たら失敗。そのあと Slack で DSH に
 メンションして、返事が来るか見る。
 
 ### 戻すとき（ロールバック）
