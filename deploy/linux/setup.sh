@@ -11,6 +11,8 @@
 #   deploy/linux/setup.sh net-refresh        copy this shell's proxy settings to the service again (restarts it)
 #   deploy/linux/setup.sh git-identity "<name>" <email>   who the bot's commits are by (not ~/.gitconfig)
 #   deploy/linux/setup.sh start --cutover    start DSH with the Slack channel (only once the old bot is stopped)
+#   deploy/linux/setup.sh start-saved        for cron: bring a started bot back when it is down (machine re-created)
+#                                            or keeps failing to reach Slack (stale proxy copy); otherwise nothing
 #   deploy/linux/setup.sh stop | restart | status | logs [N] | uninstall
 #
 # Everything the bot owns lives in $DSK_HOME (default ~/.dsh-slack): its own DSH home (DSH_HOME, so an
@@ -19,6 +21,7 @@
 #
 # Environment overrides: DSK_HOME, DSK_WORKDIR, DSK_PORT (DSH's local web server, default 4198),
 # NODE_VERSION (v24.22.1), DSH_VERSION (0.2.1-rc.2), DSK_SUPERVISOR (system | user | manual).
+# Extra variables for the bot go in $DSK_HOME/env.local (install rewrites env and appends env.local).
 set -euo pipefail
 umask 077
 
@@ -92,6 +95,10 @@ write_net_env() {
     NET_NAMES+=(NODE_USE_ENV_PROXY)
   fi
 }
+
+shell_has_proxy() { local name; for name in https_proxy HTTPS_PROXY http_proxy HTTP_PROXY all_proxy ALL_PROXY; do [ -n "${!name:-}" ] && return 0; done; return 1; }
+
+env_has_proxy() { [ -f "$ENV_FILE" ] && grep -qE '^(https?_proxy|all_proxy|HTTPS?_PROXY|ALL_PROXY)=' "$ENV_FILE"; }
 
 supervisor() {
   if [ -n "${DSK_SUPERVISOR:-}" ]; then printf '%s\n' "$DSK_SUPERVISOR"; return; fi
@@ -212,6 +219,22 @@ EOF
   say "wrote $dir/$UNIT.service"
 }
 
+unit_path() {
+  case "$(supervisor)" in
+    system) printf '/etc/systemd/system/%s.service\n' "$UNIT" ;;
+    user) printf '%s/.config/systemd/user/%s.service\n' "$HOME" "$UNIT" ;;
+  esac
+}
+
+# One start / stop / start-saved at a time: a cron run and a person can overlap, and a stop must not be
+# undone by a start-saved that read `wanted` just before it was removed. fd 9 is closed for the bot itself
+# (manual_start), so the lock never outlives this script.
+lock_kit() { # seconds to wait
+  exec 9> "$DSK_HOME/.lock"
+  command -v flock >/dev/null 2>&1 || return 0
+  flock -w "$1" 9
+}
+
 pidfile() { printf '%s/%s.pid\n' "$DSK_HOME" "$UNIT"; }
 
 # Alive while any process of its group is (the loop leader can die before its child).
@@ -221,7 +244,7 @@ manual_start() {
   if manual_running; then say "$UNIT already running (pid $(cat "$(pidfile)"))"; return; fi
   mkdir -p "$LOG_DIR"
   # setsid: own process group, so stop can take the restart loop and DSH together.
-  ( cd "$DSK_WORKDIR" && setsid bash -c 'while :; do "$@"; rc=$?; echo "$(date -u +%FT%TZ) exited with $rc; restarting in 15s"; sleep 15; done' \
+  ( cd "$DSK_WORKDIR" && exec 9>&- && setsid bash -c 'while :; do "$@"; rc=$?; echo "$(date -u +%FT%TZ) exited with $rc; restarting in 15s"; sleep 15; done' \
     _ "$DSK_NODE" "$DSH_JS" --profile slack --patch "$SLACK_PATCH" --port "$DSK_PORT" --no-open >> "$LOG_FILE" 2>&1 < /dev/null & echo $! > "$(pidfile)" )
   say "started $UNIT (pid $(cat "$(pidfile)"), log $LOG_FILE)"
 }
@@ -259,6 +282,33 @@ service_stop() {
     *) sctl disable --now "$UNIT.service" >/dev/null 2>&1 || true; say "stopped + disabled $UNIT" ;;
   esac
 }
+
+# When the running bot started, as UTC "YYYY-MM-DDTHH:MM:SS" (empty when unknown).
+running_since() {
+  local at
+  case "$(supervisor)" in
+    manual) [ -f "$(pidfile)" ] && date -u -r "$(pidfile)" +%FT%T 2>/dev/null || true ;;
+    *) at="$(sctl show "$UNIT.service" -p ActiveEnterTimestamp --value 2>/dev/null || true)"
+       [ -n "$at" ] && [ "$at" != n/a ] && date -u -d "$at" +%FT%T 2>/dev/null || true ;;
+  esac
+}
+
+# Each Socket Mode attempt of the bot ends in one of these dsh.log lines, as "<ts> <what>" (only those at
+# or after $1, an ISO time, when given). "socket connected" comes from log-stdout.mjs (Slack's hello).
+socket_lines() {
+  [ -f "$LOG_FILE" ] || return 0
+  sed -nE 's/^([0-9T:.-]+Z) [A-Z]+ \[slack-(channel|socket)\] (socket connected|socket closed|socket connect failed|apps\.connections\.open failed).*/\1 \3/p' "$LOG_FILE" |
+    awk -v since="${1:-}" '$1 >= since' || true
+}
+
+# The channel retries every few seconds, so three attempts in a row without "socket connected" since the
+# bot started = it cannot reach Slack (a dead or refused proxy copy, or Slack itself is down).
+socket_failing() {
+  local last; last="$(socket_lines "$(running_since)" | tail -n 3)"
+  [ "$(grep -c . <<<"$last")" -ge 3 ] && ! grep -q 'socket connected' <<<"$last"
+}
+
+connected_since() { grep -q 'socket connected' <<<"$(socket_lines "$1")"; }
 
 # Log lines with DSH's local web-server token masked (the URL line carries ?token=…).
 masked_log() { sed -E 's/([?&]token=)[A-Za-z0-9_-]+/\1<hidden>/g' "$LOG_FILE"; }
@@ -310,6 +360,8 @@ DSK_HOME=$DSK_HOME
 DSK_NODE=$node
 EOF
   [ -n "$kept_git" ] && printf '%s\n' "$kept_git" >> "$ENV_FILE"
+  # Lines added by hand would be lost here (start-saved re-runs install after the machine is re-created).
+  [ -f "$DSK_HOME/env.local" ] && cat "$DSK_HOME/env.local" >> "$ENV_FILE"
   # A service starts without this shell's proxy settings. Where direct egress is blocked (Muse's VM
   # answers https on :443 with plain text) DSH then reaches neither Slack nor the models.
   write_net_env "$ENV_FILE"
@@ -342,6 +394,7 @@ EOF
     say "no usable systemd: the bot runs as a background loop (log $LOG_FILE). It does NOT start again after a"
     say "reboot by itself — add to crontab:  @reboot $SELF start-saved"
   fi
+  say "where /etc does not survive a reboot (the unit is lost), run every 10 min from cron: $SELF start-saved"
   if service_running; then say "the bot is running: it keeps its old environment and configs until: $SELF restart"; fi
 
   step "done"
@@ -411,9 +464,8 @@ cmd_netcheck() {
 # the shell's proxy settings changed after install), and restart the bot if it was started. Names only.
 cmd_net_refresh() {
   [ -f "$ENV_FILE" ] || die "$ENV_FILE not found — run: $SELF install"
-  local name names="" proxy="" tmp="$ENV_FILE.tmp"
-  for name in https_proxy HTTPS_PROXY http_proxy HTTP_PROXY all_proxy ALL_PROXY; do [ -n "${!name:-}" ] && proxy=1; done
-  [ -n "$proxy" ] || die "this shell has no proxy settings — run this from the shell whose proxy works; $ENV_FILE left as it is"
+  local name names="" tmp="$ENV_FILE.tmp"
+  shell_has_proxy || die "this shell has no proxy settings — run this from the shell whose proxy works; $ENV_FILE left as it is"
   for name in $NET_VARS; do names="$names|$name"; done
   grep -vE "^(${names#|})=" "$ENV_FILE" > "$tmp" || true
   write_net_env "$tmp"
@@ -458,16 +510,17 @@ cmd_start() {
   [ "${1:-}" = --cutover ] || die "the old bot must be stopped first (two DSH Slack channels on one Slack app split the events between them). Once it is: $SELF start --cutover"
   [ -f "$SLACK_FILE" ] || die "no Slack tokens yet ($SLACK_FILE) — run keygen + import first"
   load_env
+  lock_kit 120 || die "another start/stop/start-saved is running ($DSK_HOME/.lock)"
   local from=0 _ found=""
   [ -f "$LOG_FILE" ] && from="$(wc -c < "$LOG_FILE")"
   service_start
   echo started > "$DSK_HOME/wanted"
-  # The channel logs "own identity resolved" once Slack's Web API answered; a bad token or no route to
-  # Slack shows up as warnings instead. (A healthy Socket Mode connection logs nothing.)
+  # "own identity resolved" = Slack's Web API answered, "socket connected" = Slack accepted the Socket Mode
+  # connection; a bad token or no route to Slack shows up as warnings instead.
   for _ in $(seq 1 45); do
     sleep 2
-    found="$(tail -c +"$((from + 1))" "$LOG_FILE" 2>/dev/null | grep -E 'own identity resolved|apps.connections.open failed|socket connect failed|socket loop crashed|slack-channel: no (bot|app) token' | head -n 3 || true)"
-    [ -n "$found" ] && break
+    found="$(tail -c +"$((from + 1))" "$LOG_FILE" 2>/dev/null | grep -E 'own identity resolved|socket connected|apps.connections.open failed|socket connect failed|socket closed|socket loop crashed|slack-channel: no (bot|app) token' | head -n 4 || true)"
+    grep -qE 'socket connected|failed|socket closed|crashed|no (bot|app) token' <<<"$found" && break
   done
   say "--- Slack channel"
   if [ -n "$found" ]; then say "$found"; else say "no Slack channel line yet after 90 s"; fi
@@ -475,12 +528,52 @@ cmd_start() {
   tail -c +"$((from + 1))" "$LOG_FILE" 2>/dev/null | sed -E 's/([?&]token=)[A-Za-z0-9_-]+/\1<hidden>/g' | tail -n 12
 }
 
-cmd_start_saved() { # @reboot entry for the manual supervisor
-  [ -f "$DSK_HOME/wanted" ] && service_start
-  return 0
+# For cron (every few minutes) or @reboot: bring back a bot that was started with start --cutover and not
+# stopped since ($DSK_HOME/wanted), using only what survives in $DSK_HOME. Prints "start-saved:" lines
+# saying what it did; exit 1 only when it tried and failed.
+#  - not wanted: nothing. A stopped bot stays stopped.
+#  - wanted, running, Slack's socket not failing: nothing.
+#  - wanted, not running (machine re-created: the unit in /etc is gone): install again with this shell's
+#    proxy settings (configs, secrets and sessions kept), then start. A shell without proxy settings keeps
+#    the env file's and only writes the unit again.
+#  - wanted, running, the last socket attempts all failed: take this shell's proxy settings and restart.
+cmd_start_saved() {
+  local since _
+  [ -f "$DSK_HOME/wanted" ] || { say "start-saved: not wanted (stopped, or never started with --cutover) — nothing to do"; return 0; }
+  lock_kit 5 || { say "start-saved: another start/stop/start-saved is running — nothing to do"; return 0; }
+  [ -f "$DSK_HOME/wanted" ] || { say "start-saved: stopped meanwhile — nothing to do"; return 0; }
+  if [ -f "$ENV_FILE" ] && service_running; then
+    socket_failing || { say "start-saved: running — nothing to do"; return 0; }
+    shell_has_proxy || die "start-saved: the bot cannot reach Slack (last socket attempts failed) and this shell has no proxy settings to give it"
+    say "start-saved: RESTARTING — the bot cannot reach Slack (last socket attempts failed); taking this shell's proxy settings"
+    since="$(date -u +%FT%T)"
+    cmd_net_refresh
+  else
+    since="$(date -u +%FT%T)"
+    if ! shell_has_proxy && env_has_proxy; then
+      say "start-saved: RECOVERING — the bot should run but does not; this shell has no proxy settings, so the env file's are kept"
+      load_env
+      [ -x "$DSK_NODE" ] && [ -f "$DSH_JS" ] || die "start-saved: Node or the dsh CLI is gone, and this shell has no proxy settings to download them"
+      [ "$(supervisor)" = manual ] || [ -f "$(unit_path)" ] || write_unit "$(supervisor)"
+    else
+      say "start-saved: RECOVERING — the bot should run but does not; install again (configs, secrets and sessions kept; log $LOG_DIR/start-saved.log), then start"
+      if ! "$SELF" install > "$LOG_DIR/start-saved.log" 2>&1; then
+        tail -n 15 "$LOG_DIR/start-saved.log"
+        die "start-saved: install failed"
+      fi
+      load_env
+    fi
+    service_start
+  fi
+  for _ in $(seq 1 60); do connected_since "$since" && break; sleep 2; done
+  socket_lines "$since" | tail -n 3
+  service_running || die "start-saved: the bot is not running after the start"
+  connected_since "$since" || die "start-saved: started, but Slack's socket did not connect within 120 s"
+  say "start-saved: done — the bot is running and connected to Slack"
 }
 
 cmd_stop() {
+  [ -d "$DSK_HOME" ] && { lock_kit 120 || die "another start/stop/start-saved is running ($DSK_HOME/.lock)"; }
   service_stop
   rm -f "$DSK_HOME/wanted"
 }
@@ -499,7 +592,11 @@ cmd_status() {
   local mode; mode="$(supervisor)"
   say "supervisor: $mode"
   if service_running; then say "$UNIT: running"; else say "$UNIT: not running"; fi
-  [ -f "$DSK_HOME/wanted" ] && say "started with --cutover: yes (comes back after a reboot)" || say "started with --cutover: no"
+  if [ -f "$DSK_HOME/wanted" ]; then
+    say "started with --cutover: yes (start-saved brings it back when it is down; run it from cron where /etc is lost on reboot)"
+    [ "$(supervisor)" = manual ] || [ -f "$(unit_path)" ] || say "service unit: MISSING ($(unit_path)) — run: $SELF start-saved"
+  else say "started with --cutover: no"; fi
+  say "last Slack socket attempts: $(socket_lines | tail -n 3 | tr '\n' ';' | sed 's/;$//; s/;/; /g')"
   [ -f "$SLACK_FILE" ] && say "Slack tokens: present" || say "Slack tokens: missing (keygen + import)"
   if [ -f "$LOG_FILE" ]; then
     say "--- last Slack channel lines"
@@ -516,6 +613,7 @@ cmd_logs() {
 }
 
 cmd_uninstall() {
+  [ -d "$DSK_HOME" ] && { lock_kit 120 || die "another start/stop/start-saved is running ($DSK_HOME/.lock)"; }
   service_stop
   rm -f "$DSK_HOME/wanted"
   case "$(supervisor)" in
@@ -540,5 +638,5 @@ case "${1:-}" in
   status) cmd_status ;;
   logs) shift; cmd_logs "$@" ;;
   uninstall) cmd_uninstall ;;
-  *) sed -n '2,21p' "$SELF" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,24p' "$SELF" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

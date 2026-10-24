@@ -20,6 +20,28 @@ muse() { env http_proxy=$PROXY https_proxy=$PROXY all_proxy=$PROXY no_proxy=loca
   HTTP_PROXY=$PROXY HTTPS_PROXY=$PROXY ALL_PROXY=$PROXY NO_PROXY=localhost,127.0.0.1 \
   NODE_EXTRA_CA_CERTS=$FAKE/ca.crt HOME=$HOME "$@"; }
 
+# A proxy on :8890 that answers every CONNECT with 407 (stale credentials): Node says only "fetch failed" (code 0).
+start_refuser() {
+  python3 -c 'import socketserver
+class H(socketserver.BaseRequestHandler):
+    def handle(self):
+        self.request.recv(4096); self.request.sendall(b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+socketserver.ThreadingTCPServer.allow_reuse_address = True
+socketserver.ThreadingTCPServer(("127.0.0.1", 8890), H).serve_forever()' &
+  refuser=$!
+  trap 'kill $refuser 2>/dev/null' EXIT
+  sleep 1
+}
+stop_refuser() { kill $refuser 2>/dev/null; wait $refuser 2>/dev/null; trap - EXIT; }
+# The service env's proxy variables → 127.0.0.1:<port> (a stale copy).
+point_env_proxy_at() { sed -i -E 's#^(https?_proxy|HTTPS?_PROXY|all_proxy|ALL_PROXY)=.*#\1="http://127.0.0.1:'"$1"'"#' $DSK/env; }
+# Simulate the VM being re-created: the unit and its enable link in /etc are gone, the bot is down.
+lose_unit() {
+  systemctl disable --now dsh-slack.service >/dev/null 2>&1
+  rm -f /etc/systemd/system/dsh-slack.service
+  systemctl daemon-reload
+}
+
 section "network like the VM"
 # REDIRECT turns an outside destination into 127.0.0.1 with a non-loopback source: allow that.
 sysctl -qw net.ipv4.conf.all.route_localnet=1
@@ -171,23 +193,14 @@ grep -q '"ws":"connected"' $LOG && fail "check opened the Slack socket" || pass 
 section "net-refresh: a stale proxy copy in the env file"
 envsum() { grep -vE '^(https?|all|no|HTTPS?|ALL|NO)_(proxy|PROXY)=|^NODE_USE_ENV_PROXY=' $DSK/env | sha256sum; }
 others_before="$(envsum)"
-sed -i -E 's#^(https?_proxy|HTTPS?_PROXY|all_proxy|ALL_PROXY)=.*#\1="http://127.0.0.1:8889"#' $DSK/env
+point_env_proxy_at 8889
 $REPO/deploy/linux/setup.sh check --no-model > /tmp/check-stale.log 2>&1 && fail "check passed with a dead proxy" || pass "check fails with a dead proxy in the env file"
 grep -m1 'Slack Web API\|Slack bot token' /tmp/check-stale.log
 grep -q 'proxy in the service environment is unreachable' /tmp/check-stale.log && pass "check names the unreachable proxy" || fail "check does not name the unreachable proxy"
-# A proxy that answers every CONNECT with 407 (stale credentials): Node says only "fetch failed" (code 0).
-python3 -c 'import socketserver
-class H(socketserver.BaseRequestHandler):
-    def handle(self):
-        self.request.recv(4096); self.request.sendall(b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-socketserver.ThreadingTCPServer.allow_reuse_address = True
-socketserver.ThreadingTCPServer(("127.0.0.1", 8890), H).serve_forever()' &
-refuser=$!
-trap 'kill $refuser 2>/dev/null' EXIT
-sed -i -E 's#^(https?_proxy|HTTPS?_PROXY|all_proxy|ALL_PROXY)=.*#\1="http://127.0.0.1:8890"#' $DSK/env
-sleep 1
+start_refuser
+point_env_proxy_at 8890
 $REPO/deploy/linux/setup.sh check --no-model > /tmp/check-refused.log 2>&1 && fail "check passed through a refusing proxy" || pass "check fails through a proxy that answers 407"
-kill $refuser 2>/dev/null; trap - EXIT
+stop_refuser
 grep -m1 'Slack Web API\|Slack bot token' /tmp/check-refused.log
 grep -q 'the proxy refused the tunnel' /tmp/check-refused.log && pass "check names the refused tunnel" || fail "check does not name the refused tunnel"
 before="$(sha256sum < $DSK/env)"
@@ -243,11 +256,60 @@ grep -q "restarted dsh-slack" /tmp/netrefresh2.log && pass "net-refresh restarte
 sleep 20
 [ "$(grep -c '"ws":"connected"' $LOG)" -ge 3 ] && pass "reconnected after net-refresh" || fail "no reconnect after net-refresh"
 
+section "start-saved: running and connected → nothing"
+grep -q 'INFO \[slack-socket\] socket connected (num_connections=1)' $DSK/logs/dsh.log && pass "dsh.log has Slack's hello (socket connected)" || fail "no socket connected line in dsh.log"
+muse $REPO/deploy/linux/setup.sh start-saved > /tmp/ss1.log 2>&1 && pass "start-saved exit 0" || fail "start-saved exit $?"
+cat /tmp/ss1.log
+grep -q 'start-saved: running — nothing to do' /tmp/ss1.log && pass "start-saved leaves a connected bot alone" || fail "start-saved acted on a connected bot"
+(flock $DSK/.lock sleep 12) & holder=$!; sleep 1
+muse $REPO/deploy/linux/setup.sh start-saved > /tmp/ss-lock.log 2>&1; rc=$?
+wait $holder
+grep -q 'another start/stop/start-saved is running' /tmp/ss-lock.log && [ $rc = 0 ] && pass "start-saved yields to a held lock" || { fail "start-saved under a held lock (rc $rc)"; cat /tmp/ss-lock.log; }
+
+section "start-saved after the machine is re-created, from a shell without proxy settings"
+lose_unit
+$REPO/deploy/linux/setup.sh status > /tmp/status-lost.log 2>&1
+grep -q 'service unit: MISSING' /tmp/status-lost.log && pass "status names the missing unit" || { fail "status does not name the missing unit"; cat /tmp/status-lost.log; }
+before_env="$(sha256sum < $DSK/env)"
+$REPO/deploy/linux/setup.sh start-saved > /tmp/ss2.log 2>&1 && pass "start-saved (no proxy in the shell)" || fail "start-saved (no proxy in the shell) exit $?"
+cat /tmp/ss2.log
+grep -q "env file's are kept" /tmp/ss2.log && pass "the env file's proxy settings were kept" || fail "start-saved did not keep the env file's proxy settings"
+[ "$(sha256sum < $DSK/env)" = "$before_env" ] && pass "env file unchanged" || fail "env file changed"
+[ -f /etc/systemd/system/dsh-slack.service ] && systemctl is-active --quiet dsh-slack.service && pass "unit written again, running" || fail "unit/service not back"
+grep -q 'start-saved: done — the bot is running and connected to Slack' /tmp/ss2.log && pass "start-saved saw Slack's socket connect" || fail "start-saved: no socket connect"
+
+section "start-saved after the machine is re-created, from the proxy shell → install again"
+lose_unit
+muse $REPO/deploy/linux/setup.sh start-saved > /tmp/ss3.log 2>&1 && pass "start-saved (proxy shell)" || fail "start-saved (proxy shell) exit $?"
+cat /tmp/ss3.log
+grep -q 'install again' /tmp/ss3.log && grep -q 'start-saved: done' /tmp/ss3.log && pass "installed again and connected" || fail "no re-install + connect"
+grep -q 'already installed' $DSK/logs/start-saved.log && pass "the installed dsh CLI was kept" || fail "dsh CLI installed anew"
+systemctl is-enabled --quiet dsh-slack.service && pass "enabled again" || fail "not enabled"
+
+section "start-saved: running, but the proxy copy is refused → net-refresh + restart"
+start_refuser
+point_env_proxy_at 8890
+systemctl restart dsh-slack.service
+since="$(date -u +%FT%T)"
+for _ in $(seq 1 60); do
+  [ "$(sed -nE 's/^([0-9T:.-]+Z) .*apps\.connections\.open failed.*/\1/p' $DSK/logs/dsh.log | awk -v s="$since" '$1 >= s' | wc -l)" -ge 3 ] && break
+  sleep 2
+done
+grep 'apps.connections.open failed' $DSK/logs/dsh.log | tail -n 1 | cut -c1-200
+muse $REPO/deploy/linux/setup.sh start-saved > /tmp/ss4.log 2>&1 && pass "start-saved (refused proxy)" || fail "start-saved (refused proxy) exit $?"
+stop_refuser
+cat /tmp/ss4.log
+grep -q 'start-saved: RESTARTING' /tmp/ss4.log && grep -q 'start-saved: done' /tmp/ss4.log && pass "net-refresh + restart, connected again" || fail "no recovery from a refused proxy"
+grep -q '127.0.0.1:8890' $DSK/env && fail "the refused proxy is still in the env file" || pass "env file has the shell's proxy again"
+leak_check /tmp/ss1.log /tmp/ss2.log /tmp/ss3.log /tmp/ss4.log /tmp/status-lost.log $DSK/logs/start-saved.log
+
 section "stop"
 $REPO/deploy/linux/setup.sh stop
 systemctl is-active --quiet dsh-slack.service && fail "still running" || pass "stopped"
 systemctl is-enabled --quiet dsh-slack.service && fail "still enabled" || pass "disabled (no start at boot)"
 pgrep -af 'dsh/lib/bin.js' | grep -v pgrep && fail "processes left" || pass "no bot processes left"
+$REPO/deploy/linux/setup.sh start-saved > /tmp/ss5.log 2>&1
+grep -q 'start-saved: not wanted' /tmp/ss5.log && ! systemctl is-active --quiet dsh-slack.service && pass "start-saved leaves a stopped bot stopped" || { fail "start-saved after stop"; cat /tmp/ss5.log; }
 ls -la $DSK/home/ | grep -E 'slack-state' || true
 
 section "Muse's own files untouched, no secret in the bot's log"
