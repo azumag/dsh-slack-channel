@@ -37,9 +37,11 @@ Mac の DSH はそのまま動かしておく。**2026-10-25: VM の `check` は
   - 動いていない → `install` をやり直して（設定・秘密・セッション・入れた DSH はそのまま）起動
   - 動いているが、env ファイルのプロキシがトンネルを断り、ほかの設定（下）なら通る → `net-refresh`（プロキシ行を書き直して再起動）
   - サービスに渡すプロキシ設定は、`/etc/environment` のものが通ればそれ、通らなければ実行したシェルのもの（`install` /
-    `net-refresh` / `start-saved` 共通）。Muse の cron の実行ごとのシェルの認証情報は数分で断られ（407）、`/etc/environment`
-    のもの（VM の起動時に書かれる）は 80 分以上通った（2026-10-25、opencode キットで実測）。シェルのものを写すと、次の cron で
-    また写し直す再起動の繰り返しになる（opencode ボットで 10 分ごとに起きた）。
+    `net-refresh` / `start-saved` 共通）。シェルのプロキシ URL には実行ごとの認証情報
+    （user:pass@）が入っていて、Muse の cron の実行ごとのものは数分で断られる（407）。`/etc/environment` のプロキシ URL には認証情報が
+    入っておらず、プロキシは認証情報なしの CONNECT を通す（2026-10-25、Claude キットの netcheck と opencode ボットで確認）。
+    シェルのものを写すと、次の cron でまた写し直す再起動の繰り返しになる（opencode ボットで 10 分ごとに起きた。/etc/environment
+    に替えてからは止まった）。
   - 動いているが、直近 3 回の Slack ソケット接続がすべて失敗 → `net-refresh`
   - `start` / `stop` とロック（`~/.dsh-slack/.lock`）を共有するので、人の `stop` とぶつからない。動いたときの記録は
     `~/.dsh-slack/logs/start-saved.history`（`status` が最後の 5 件を出す）。再起動は動いているターンを中断する（キューには戻る）。
@@ -156,7 +158,7 @@ check の出力をそのまま返信してください（秘密の値は出ま�
 
 プロキシ設定が古くなる件は、`start-saved` が env ファイルのプロキシを試して、断られていれば `/etc/environment` の設定
 （通るとき）か cron のシェルの設定で `net-refresh` する（上の「VM で動くもの」）。cron のシェルの認証情報は数分で断られ、
-`/etc/environment` のものは長く通る（opencode キットでの実測）。DSH のサービスで効くかは VM で未確認。
+`/etc/environment` のものは認証情報なしで通る（上）。
 
 **依頼文 2b の結果（2026-10-25 ~02:50 JST、Muse の報告）:** 874e052 に更新。git の名義 azumag
 <azumag@users.noreply.github.com>（ボットの env だけ）。`net-refresh` → `network settings taken from /etc/environment`。
@@ -188,7 +190,7 @@ integrate.api.nvidia.com に CONNECT 200 → HTTP 200。`check` は all checks p
 ```
 
 3. は、Muse の cron のシェルの認証情報が数分で断られる件の確認。`net-refresh` の出力が `network settings taken from
-/etc/environment` なら、サービスは VM の起動時に書かれた設定を使う。`netcheck` の `etc-environment https_proxy → …: CONNECT 200`
+/etc/environment` なら、サービスは認証情報の入っていない /etc/environment の設定を使う。`netcheck` の `etc-environment https_proxy → …: CONNECT 200`
 と、`check` の全項目 ✓ で、その設定で DSH が Slack・モデル・Web 検索に届くことが分かる。
 
 ボットを起動する前に cron を入れても、`~/.dsh-slack/wanted` が無い間は何もしない。`start --cutover` の後は、VM が作り直されても
