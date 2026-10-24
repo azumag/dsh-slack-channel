@@ -63,7 +63,7 @@ Mac の DSH はそのまま動かしておく。**2026-10-25: VM の `check` は
 | 1 | Muse に依頼 | clone → `install` → `keygen`。公開鍵 `dsk-pub1:…` と環境情報を返してもらう |
 | 2 | Mac | 公開鍵に向けて秘密を暗号化（`dsk-sealed1:…` の 1 行ができる） |
 | 3 | Muse に依頼 | `import` → `check`。結果を返してもらう（**2026-10-25 通過**） |
-| 3b | Muse に依頼（依頼文 2b） | `git-identity`、`start-saved` を手で 1 回、10 分ごとの cron 登録 |
+| 3b | Muse に依頼（依頼文 2b） | `git-identity`、/etc/environment のプロキシで `check`、`start-saved` を手で 1 回、10 分ごとの cron 登録 |
 | 4 | owner | 切り替えるか判断（上の表） |
 | 5 | Mac | Mac の DSH の Slack チャンネルを止める（同じ Slack アプリで 2 つ動くと、イベントが振り分けられて両方おかしくなる） |
 | 6 | Muse に依頼（依頼文 3） | `install`（消えたサービスとプロキシ設定を作り直す）→ `start --cutover` |
@@ -167,14 +167,22 @@ check の出力をそのまま返信してください（秘密の値は出ま�
    cd ~/dsh-slack-channel && git pull --ff-only
 2. ボットのコミットの名義（~/.gitconfig は変えません）
    ~/dsh-slack-channel/deploy/linux/setup.sh git-identity "azumag" azumag@users.noreply.github.com
-3. 手で 1 回試す。まだ起動の合図前なので「start-saved: not wanted … nothing to do」で終わるはずです（終了コード 0）
+3. サービスのプロキシ設定を /etc/environment のもの（通るとき）に書き直して確かめる（値は出ません。ボットは起動していないので再起動もしません。check はモデルの確認で 1〜3 分かかります）
+   ~/dsh-slack-channel/deploy/linux/setup.sh net-refresh
+   ~/dsh-slack-channel/deploy/linux/setup.sh netcheck
+   ~/dsh-slack-channel/deploy/linux/setup.sh check
+4. 手で 1 回試す。まだ起動の合図前なので「start-saved: not wanted … nothing to do」で終わるはずです（終了コード 0）
    ~/dsh-slack-channel/deploy/linux/setup.sh start-saved; echo "exit=$?"
-4. あなたの cron に 10 分ごとのジョブを登録してください（名前の例: dsh-bot-autorecover。claude-bot-autorecover と同じ形）
+5. あなたの cron に 10 分ごとのジョブを登録してください（名前の例: dsh-bot-autorecover。claude-bot-autorecover と同じ形）
    ~/dsh-slack-channel/deploy/linux/setup.sh start-saved
    報告は、出力に RECOVERING / RESTARTING / error が出たとき、または終了コードが 0 以外のときだけにしてください。「nothing to do」のときは何も言わなくて大丈夫です。
 
-返信してほしいもの: git pull の最後の 1 行 / git-identity と start-saved の出力 / 登録した cron の名前と間隔。
+返信してほしいもの: git pull の最後の 1 行 / git-identity・net-refresh・netcheck・check・start-saved の出力 / 登録した cron の名前と間隔。
 ```
+
+3. は、Muse の cron のシェルの認証情報が数分で断られる件の確認。`net-refresh` の出力が `network settings taken from
+/etc/environment` なら、サービスは VM の起動時に書かれた設定を使う。`netcheck` の `etc-environment https_proxy → …: CONNECT 200`
+と、`check` の全項目 ✓ で、その設定で DSH が Slack・モデル・Web 検索に届くことが分かる。
 
 ボットを起動する前に cron を入れても、`~/.dsh-slack/wanted` が無い間は何もしない。`start --cutover` の後は、VM が作り直されても
 10 分ほどで戻る。`stop`（ロールバック）で `wanted` が消えると、また何もしなくなる。
