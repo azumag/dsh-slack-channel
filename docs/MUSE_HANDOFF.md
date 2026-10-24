@@ -1,0 +1,189 @@
+# DSH ボットを Muse の VM に移す手順
+
+DSH（DeepSeek Harness）の Slack ボット（<@U0C9C7BNVB5>）を、Muse（<@U0CCCH69XMW>）の VM で動かすための手順。
+Muse にはプロンプトでしか頼めないので、VM 側の作業はすべて `deploy/linux/setup.sh` のサブコマンドにしてある。
+Mac 側（owner）の作業は、秘密の暗号化と、切り替え時の Mac 側 Slack チャンネルの停止だけ。
+
+**2026-10-24 時点の方針（owner 決定）: キットを作って VM で `check` まで通し、切り替え（cutover）は後で判断する。**
+Mac の DSH はそのまま動かしておく。
+
+## VM で動くもの
+
+- DSH 本体は npm 公開版の CLI `@deepseek-ai/dsh`（Mac のデスクトップアプリと同じ 0.2.1-rc.2）。`dsh --profile slack` で、
+  Mac の desktop プロファイルと同じバンドル（dsh-base + dsh-web-app + auto-review）を Node のサーバーとして動かす。
+  GUI はなく、DSH 自身の Web サーバーは 127.0.0.1:4198 だけで待つ。
+- Slack チャンネルはこのリポジトリの `src/`（Mac で動いているものと同じコミット）。設定は Mac の `~/.dsh/cordis.patch.yml` の
+  slack-channel 行と同じ（モデルチェーン、`maxConcurrentTurns: 1`、`mentionRewrites`、surface ガード、チーム名簿）。
+- すべて `~/.dsh-slack` の中: DSH のホーム（`DSH_HOME=~/.dsh-slack/home`。VM に `~/.dsh` があっても読まない・変えない）、
+  共有エージェント設定（`DSH_AGENTS_HOME=~/.dsh-slack/agents`。Muse の `~/.agents` は読まない）、Node、dsh CLI、秘密、ログ。
+- エージェントの作業場所は `~/work`（`DSK_WORKDIR` で変更可）。
+- 秘密: Slack トークンは `~/.dsh-slack/secrets/slack.json`、モデルの API キー（NVIDIA / OpenCode Go / DeepSeek）は
+  `~/.dsh-slack/home/.env`（DSH が公式に読む場所）。どちらも 600。GitHub は VM の `gh auth token`（Muse の gh ログイン）を
+  DSH 起動時に読む。Mac のトークンはコピーしない。
+- bash ツールのコマンドは Mac と同じ `permissionPreset: workspace-write` のサンドボックスの中で動く（作業場所と `/tmp` 以外は
+  読み取り専用）。Linux の DSH は bubblewrap（`bwrap`）、無ければ Landlock を使い、どちらも使えないと**コマンドを 1 つも実行しない**
+  （`no sandbox backend is usable`。サンドボックスなしで動かす設定にはしない）。`check` の `command sandbox` 行で分かる。
+- サービスは systemd の `dsh-slack.service` 1 つ。`start --cutover` まで作られるだけで起動しない。Slack チャンネルの設定
+  （`~/.dsh-slack/slack-channel.patch.yml`）はサービスだけが読むので、`check` が Slack のソケットにつなぐことはない。
+
+## Mac から移らないもの（切り替えを判断するときに見る）
+
+| もの | VM では |
+|---|---|
+| 既存スレッドの会話（228 スレッド、セッション 361 MB。Mac のパス前提） | 持ち越さない。既存スレッドで次にメンションされると、直近 20 件の発言を文脈に新しいセッションで始まる |
+| 有効なスケジュール 15 件（うち 9 件が Slack スレッドのセッション） | 移らない。Mac の DSH アプリが開いている限り Mac で実行され続ける |
+| `soren-prod-vnic` への ssh（tailnet 経由。直近 3 日で約 180 回） | VM は tailnet にいないので届かない |
+| Mac の Docker で動かすテスト用コンテナ（`docker exec canary759` など） | VM に Docker があるかは未確認 |
+| `~/work` のクローン（docich / twica / soren / agent-guards …） | VM で必要に応じて clone し直す（gh は azumag でログイン済み） |
+| Hermes の `~/work/wagyu-sync/.state` の読み取り | Hermes が Mac にいる間は読めない |
+| 切り替えの瞬間に Mac で待っていた依頼（pending キュー） | 引き継がれない。切り替え後に Slack で再依頼 |
+
+## 流れ
+
+| # | どこで | 何を |
+|---|---|---|
+| 1 | Muse に依頼 | clone → `install` → `keygen`。公開鍵 `dsk-pub1:…` と環境情報を返してもらう |
+| 2 | Mac | 公開鍵に向けて秘密を暗号化（`dsk-sealed1:…` の 1 行ができる） |
+| 3 | Muse に依頼 | `import` → `check`。結果を返してもらう |
+| 4 | owner | 切り替えるか判断（上の表）。**ここまでが 2026-10-24 の範囲** |
+| 5 | Mac | Mac の DSH の Slack チャンネルを止める（同じ Slack アプリで 2 つ動くと、イベントが振り分けられて両方おかしくなる） |
+| 6 | Muse に依頼 | `start --cutover` |
+| 7 | Slack | DSH にメンションして返事が来るか見る |
+
+## 依頼文 1（セットアップ）
+
+```text
+<@U0CCCH69XMW> お願いです。DSH の Slack ボット（<@U0C9C7BNVB5>）をあなたの VM でも動かせるように準備します。今回はセットアップと確認まで。ボット本体はまだ起動しないでください（Mac で動いている同じボットと Slack のイベントを取り合ってしまうため）。
+
+1. clone（すでにあれば、そのディレクトリで git pull --ff-only）
+   git clone https://github.com/azumag/dsh-slack-channel.git ~/dsh-slack-channel
+2. セットアップ（プロキシの環境変数が入った、いつものシェルで実行してください。sudo 不要。Node 24 と DSH の CLI が ~/.dsh-slack に入ります。数分かかります）
+   ~/dsh-slack-channel/deploy/linux/setup.sh install
+   - 「lingering is off」と出たら: sudo loginctl enable-linger $(id -un)（できなければ、その旨を報告）
+   - 「no usable systemd」と出たら: 表示された @reboot の行を crontab に追加
+3. 秘密の受け渡し用の鍵を作る
+   ~/dsh-slack-channel/deploy/linux/setup.sh keygen
+   出力された dsk-pub1: で始まる 1 行を、このスレッドにそのまま返信してください（公開鍵なので貼って大丈夫です。~/.dsh-slack/handoff-key.json は秘密鍵なので VM の外に出さないでください）。
+4. 次も報告してください: install の出力の最後の 25 行 / uname -m と OS / uname -r / id -un / gh auth status で誰としてログインしているか（トークンの値は貼らない）/ docker が使えるか（docker version の 1 行目、無ければ「なし」）/ bwrap --version（無ければ「なし」）/ ~/work にあるディレクトリの一覧
+
+やらないでほしいこと:
+- setup.sh start は実行しない（合図するまで）
+- ~/.dsh や ~/.agents（あなた自身のものがあれば）には触れない。このセットアップは ~/.dsh-slack の中で完結します
+- トークン・API キー・パスワード・鍵ファイルの中身を Slack に貼らない
+- エラーが出たら、システムの設定を変えて回避せず、エラー出力をそのまま報告する
+```
+
+## Mac 側: 秘密を暗号化する
+
+Muse が返してきた `dsk-pub1:…` を使う。出力の `dsk-sealed1:…` は、その VM の秘密鍵でしか開けない（鍵は 1 回開けると消える）。
+
+```sh
+cd ~/work/dsh-slack-channel
+node deploy/secrets.mjs seal 'dsk-pub1:…'
+```
+
+Mac の DSH の設定ファイルから直接読む（値は画面に出ない）:
+
+- Slack トークン 2 つ: `~/.dsh/cordis.patch.yml` の slack-channel 行の `botToken` / `appToken`
+- モデルの API キー 3 つ: `~/.dsh/.credentials.yaml` の `refs` の `NVIDIA_API_KEY` / `OPENCODE_GO_API_KEY` / `DEEPSEEK_API_KEY`
+  （Slack のフォールバックチェーンが使うものだけ。ほかも渡すなら `--keys NAME,NAME…`）
+
+GitHub のトークン（Mac の `~/.dsh/cordis.patch.yml` の MCP 行）は渡さない。VM では VM 自身の `gh auth token` を使う。
+
+## 依頼文 2（秘密を入れて確認）
+
+```text
+<@U0CCCH69XMW> 続きです。暗号化した秘密を渡します（あなたの VM の秘密鍵でしか開けません）。
+
+~/dsh-slack-channel/deploy/linux/setup.sh import 'dsk-sealed1:…ここに貼る…'
+~/dsh-slack-channel/deploy/linux/setup.sh check
+
+check の出力をそのまま返信してください（秘密の値は出ません。モデルの確認で 1〜3 分かかります）。Slack のソケットにはつながないので、まだ start はしないでください。
+```
+
+`check` で見るところ:
+
+- `✓ dsh CLI — 0.2.1-rc.2`: DSH の CLI が入った。
+- `✓ Slack channel plugin — loads on this Node`: Slack チャンネルのコードがこの Node で読める。
+- `✓ command sandbox — bwrap` または `— Landlock, fully enforced`: bash ツールがコマンドを実行できる。`✗ command sandbox — none usable`
+  なら、ボットはコマンドを 1 つも実行できない（下の「bubblewrap を入れる」）。
+- `✓ DSH config — profile "slack" composes with the Slack channel overlay`: プロファイル + 設定 + Slack チャンネルの組み立てが通る（起動はしない）。
+- `✓ Slack bot token — bot dsh (U0C9C7BNVB5) in azumaya`: 同じボットのトークンが入った。
+- `✓ Slack app token — Socket Mode URL issued (not connected)`: app トークンが有効。
+- `✓ Slack socket host — … reachable`: ソケットの接続先まで届く（ソケットは開かない）。
+- `✓ model API keys` と `· model chain`: キーの名前と、Slack のモデルチェーン。
+- `✓ model nvidia/… — answered OK in N s (dsh headless)`: VM の DSH がそのプロバイダのモデルを呼べた。既定はプロバイダごとに 1 つ
+  （NVIDIA / OpenCode Go / DeepSeek）。`check --all-routes` でチェーンの全モデル（主モデル GLM-5.3 は 1 回に数分かかる）。
+- `· GitHub CLI — logged in as …` と `✓ GitHub MCP token`: ボットはこのアカウントで GitHub を操作する。
+- `· git user.name — …`: ボットのコミットの名義。未設定なら
+  `setup.sh git-identity "azumag" azumag@users.noreply.github.com`（`~/.gitconfig` は変えない）。
+- `· network — proxy settings: …`: サービスの環境にあるプロキシ変数の名前。check はサービスと同じ環境（env ファイルだけ）で走る。
+  プロキシで失敗したら `setup.sh netcheck` の出力を返してもらう。
+
+### bubblewrap を入れる（`✗ command sandbox` のときだけ。VM のシステムパッケージなので owner の OK を取ってから）
+
+Landlock はカーネル次第（無効なカーネルや、seccomp で止めるコンテナがある）。bubblewrap は Ubuntu の標準パッケージ。
+
+```text
+<@U0CCCH69XMW> DSH のボットがコマンドを実行するのにサンドボックス（bubblewrap）が要ります。owner の了承済みです。プロキシの環境変数が入ったシェルで、次を実行してください（root でなければ sudo -E を付けて）。
+
+apt-get update && apt-get install -y bubblewrap
+~/dsh-slack-channel/deploy/linux/setup.sh check --no-model
+
+apt の最後の 5 行と、check の出力をそのまま返信してください。
+```
+
+## 切り替え（owner の OK が出てから）
+
+### Mac: Slack チャンネルを止める
+
+Mac の DSH はデスクトップアプリのまま残し、Slack チャンネルだけ止める。`~/.dsh/cordis.patch.yml` の slack-channel 行の
+`disabled:` を `true` にする（保存すると dsh-hmr が Slack チャンネルを読み直して切断する。**動いているターンは中断される**ので、
+owner の OK を取ってから）。切れたことは、DSH のホストプロセス（`--expose-internals`）に `wss-primary.slack.com` への
+接続が無いことで確かめる（`users.getPresence` の `connection_count` は Socket Mode を数えないので使えない）。
+
+Mac で有効なスケジュール（`~/.dsh/storages/schedule.json`）は、DSH アプリが開いている限り Mac で動き続ける。返答は Slack に
+出ないが、ツール（gh など）は実行する。止めるかどうかも切り替え時に決める。
+
+### 依頼文 3（起動）
+
+```text
+<@U0CCCH69XMW> Mac 側の DSH の Slack 接続を止めました。VM のボットを起動してください。
+
+~/dsh-slack-channel/deploy/linux/setup.sh start --cutover
+~/dsh-slack-channel/deploy/linux/setup.sh status
+
+両方の出力を返信してください。
+```
+
+`start --cutover` の出力に `own identity resolved (bot_id=…, user_id=U0C9C7BNVB5)` が出れば Slack の Web API まで届いている。
+`socket connect failed` / `apps.connections.open failed` が出たら失敗。そのあと Slack で DSH にメンションして、返事が来るか見る。
+
+### 戻すとき（ロールバック）
+
+1. Muse に `~/dsh-slack-channel/deploy/linux/setup.sh stop`（サービスを止めて、再起動時にも上がらないようにする）
+2. Mac の `~/.dsh/cordis.patch.yml` の slack-channel 行の `disabled:` を元の式
+   `!!js "ctx.get('profileContext') !== undefined && ctx.get('profileContext').name !== 'desktop'"` に戻す（HMR で再接続）
+
+## VM のファイル
+
+| パス | 中身 |
+|---|---|
+| `~/dsh-slack-channel` | このリポジトリ（Slack チャンネルのコード + キット） |
+| `~/.dsh-slack/env` | サービスの環境（HOME、PATH、DSH_HOME、プロキシ変数、ボットの git 名義）。600 |
+| `~/.dsh-slack/home/` | DSH のホーム: `cordis.patch.yml`（モデルのプロバイダ、Web 検索、GitHub MCP）、`profiles/slack/`、`.env`（API キー）、`sessions/`、`slack-state.json` |
+| `~/.dsh-slack/slack-channel.patch.yml` | Slack チャンネルの設定（サービスだけが `--patch` で読む。秘密は入っていない） |
+| `~/.dsh-slack/secrets/slack.json` | Slack トークン。600 |
+| `~/.dsh-slack/check-home/` | `check` の headless 実行用の DSH ホーム（設定とキーはリンク） |
+| `~/.dsh-slack/logs/dsh.log` | DSH のログ（`setup.sh logs`。DSH の Web 画面のトークンは伏せて表示） |
+| `/etc/systemd/system/dsh-slack.service` | サービス（root で動く VM の場合。`systemctl --user` の場合は `~/.config/systemd/user/`） |
+
+更新は `cd ~/dsh-slack-channel && git pull --ff-only` → `setup.sh restart`（動いているターンは中断され、再起動後にキューへ戻る）。
+テンプレートを変えたときは `setup.sh install --reconfigure`（古い設定は `.bak-*` で残る）。
+
+## コンテナでの確認（Mac で）
+
+`deploy/linux/test/run.sh` が、VM に似せた Ubuntu 24.04（x86_64、systemd、root で `HOME=/home/hatch`、外へは HTTP プロキシ経由だけ、
+直接の :443 は平文の箱に当たる）で、clone → install → keygen → seal/import → check → `start --cutover` → 偽の Slack のメンションに
+bash ツールを使って返答 → restart → stop を通す。bash ツールのサンドボックスは bubblewrap（OrbStack のカーネルには Landlock が
+無い）。最初の `check` だけ `bwrap` を隠して、`check` がサンドボックスの無いホストを `✗` にすることも見る。Slack・モデル API・GitHub MCP はすべて偽物（`fake-world.mjs`）。

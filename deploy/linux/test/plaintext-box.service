@@ -1,0 +1,7 @@
+[Unit]
+Description=plain-text box on :8443 (direct :443 is redirected here)
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/bin/plaintext-box.py
+Restart=always
+[Install]
+WantedBy=multi-user.target

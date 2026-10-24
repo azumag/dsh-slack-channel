@@ -1,0 +1,60 @@
+# The Slack channel of the DSH Slack bot — a --patch overlay that only the service passes
+# (written by deploy/linux/setup.sh install; @…@ filled in). Mirrors the slack-channel row
+# of the Mac's ~/.dsh/cordis.patch.yml. The tokens are read from @SLACK_FILE@ (600,
+# written by `setup.sh import`) when DSH starts, so this file holds no secret.
+- insert:
+    # DSH's log records → stdout → ~/.dsh-slack/logs/dsh.log (the CLI keeps them in memory only).
+    - id: log-stdout
+      name: @REPO_DIR@/deploy/linux/log-stdout.mjs
+    - id: slack-channel
+      name: @REPO_DIR@/src/index.js
+      inject: [agents]
+      config:
+        botToken: !!js "JSON.parse(process.getBuiltinModule('node:fs').readFileSync('@SLACK_FILE@', 'utf8')).botToken"
+        appToken: !!js "JSON.parse(process.getBuiltinModule('node:fs').readFileSync('@SLACK_FILE@', 'utf8')).appToken"
+        cwd: @WORKDIR@
+        # Main model NVIDIA GLM-5.3; any failed model call (except a stop) retries the same turn
+        # down this chain, and the primary is tried again 2 min after a switch.
+        provider: nvidia
+        model: z-ai/glm-5.3
+        fallbackCooldownMs: 120000
+        fallbacks:
+          - { provider: nvidia, model: z-ai/glm-5.3-flash }
+          - { provider: nvidia, model: deepseek-ai/deepseek-v4.1-flash }
+          - { provider: opencode-go, model: deepseek-v4.1-flash }
+          - { provider: deepseek-official, model: deepseek-flash }
+        permissionPreset: workspace-write
+        agentPreset: standard
+        allowAllChannels: true
+        stateFile: @DSH_HOME@/slack-state.json
+        threadReplies: true
+        ccUserIds: []
+        maxReplyChars: 4000
+        ackReaction: hourglass
+        # One Slack thread = one session.
+        sessionScope: thread
+        # At most one Slack turn at a time across all threads (the owner's choice, 2026-10-23).
+        maxConcurrentTurns: 1
+        mentionOnly: true
+        # Bot loop brakes (2026-10-21 DSH ↔ Claude loop).
+        mentionBackBots: false
+        mentionBackBotIds:
+          - U0CCCH69XMW   # muse
+        maxBotTurns: 10
+        maxBotRepeats: 3
+        contextMessages: 20
+        # Ids the agent may really mention in its own text (everything else is escaped).
+        mentionUserIds:
+          - U0C7AN52QGN   # hermes
+          - U0C9C7BNVB5   # DSH (this bot)
+          - U0CCCH69XMW   # muse
+          - U0C9YGA214P   # claude
+          - U0C9WNRV4KH   # cline
+          - U0C9Y2F2HEV   # opencode
+          - U0CA79CM3FF   # pi
+        surfacePrompt: |-
+          Team in this workspace (Slack ids): owner azumag (UCR3WAE2J; not mentionable from your replies, Hermes hands work to the owner); Hermes <@U0C7AN52QGN> assigns tasks and manages the queue; Muse <@U0CCCH69XMW> posts orchestration notes for the owner; implementers: Claude <@U0C9YGA214P>, CLINE <@U0C9WNRV4KH>, opencode <@U0C9Y2F2HEV>, Pi <@U0CA79CM3FF>. You are DSH: you review, track waits and decide on the owner's behalf, and you hand implementation to the implementers instead of doing it yourself. Never mention wagyu (U0C6HEG8KC6); Muse takes that place.
+          Mention someone only when you need them to act; in an acknowledgement or status reply do not mention the sender.
+        # wagyu is retired: any outbound mention of it is posted as a Muse mention.
+        mentionRewrites:
+          U0C6HEG8KC6: U0CCCH69XMW

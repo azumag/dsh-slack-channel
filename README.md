@@ -132,6 +132,10 @@ SLACK_BOT_TOKEN=xoxb-… SLACK_APP_TOKEN=xapp-… \
 
 Prefer not to restart on config changes? Set `pairToken` + `stateFile` once, then enroll channels from Slack itself with `/pair <token>` — no host restart, enrollments persist.
 
+### Linux server kit
+
+[`deploy/linux/setup.sh`](deploy/linux/setup.sh) sets the bot up on a Linux machine from a clone, without the desktop app: its own Node and the npm `dsh` CLI, a `slack` profile with the desktop profile's bundles, a systemd service (`dsh-slack.service`; a background loop where there is no systemd) and everything else under `~/.dsh-slack` (its own `DSH_HOME`). Secrets travel sealed to a one-time key generated on the target (`keygen` → `deploy/secrets.mjs seal` on the source → `import`); `check` tests the install with only the service's environment — tokens, proxy, one headless model turn per provider — without opening the Slack socket, and whether the bash tool has a command sandbox (DSH on Linux confines commands with bubblewrap, else Landlock, and runs none when neither works — `apt-get install bubblewrap` where the kernel has no Landlock); the service starts only with `start --cutover`, because two connections on one Slack app split the events. DSH's log records go to `~/.dsh-slack/logs/dsh.log` (the CLI keeps them in memory otherwise). [`deploy/linux/test/run.sh`](deploy/linux/test/run.sh) runs the whole flow in an Ubuntu container behind an HTTP proxy against fake Slack and model APIs. The walkthrough used to move the bot to another machine is [`docs/MUSE_HANDOFF.md`](docs/MUSE_HANDOFF.md) (Japanese).
+
 ## Channel commands
 
 Commands are plain messages with a verb prefix. **Prefer `!`**: Slack's own
@@ -384,4 +388,7 @@ src/message.js          frozen user-message factory (dsh-llm createUserMessage s
 src/collector.js        per-turn reply collector (last/all)
 src/sessions.js         per-channel agent manager (create/resume, state file, enrollments)
 tests/                  104-test suite + mock Web API + fake websocket (node tests/run.mjs)
+deploy/secrets.mjs      sealed secrets handoff (keygen / seal from ~/.dsh / open)
+deploy/linux/           Linux server kit: setup.sh, check.mjs, log-stdout.mjs, templates/, test/ (container test)
+docs/MUSE_HANDOFF.md    moving the bot to another machine by prompts (Japanese)
 ```

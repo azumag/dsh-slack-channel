@@ -1,0 +1,15 @@
+# The "slack" profile of the DSH Slack bot (written by deploy/linux/setup.sh install).
+# Same bundles as the Mac desktop profile; model providers, web search and the GitHub
+# MCP server live in the home patch ($DSH_HOME/cordis.patch.yml) so that the one-shot
+# headless runs of `setup.sh check` see them too. The Slack channel itself is the
+# --patch overlay slack-channel.patch.yml, which only the service passes.
+- id: ui-settings-account
+  name: "@deepseek-ai/dsh-client-ui-settings-account"
+  config:
+    version: 1
+    step: done
+    usage: detailed
+    developerTools: true
+    purpose: null
+    process: standard
+    completion: api-key
