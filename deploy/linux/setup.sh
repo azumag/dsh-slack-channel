@@ -321,21 +321,47 @@ proxy_codes() { curl -s -o /dev/null --max-time 20 -x "$1" -w '%{http_connect} %
 proxy_refused() { case "$1" in 401\ *|403\ *|407\ *) return 0 ;; esac; return 1; }
 proxy_passes() { case "$1" in 200\ *) return 0 ;; esac; return 1; }
 
-# Muse's VM hands each shell new proxy credentials, and the copy in the env file can stop working. The
-# running bot does not notice on Slack (its socket was opened earlier), but every new connection (each
-# model call, web search, GitHub) is refused. 0 when the proxy refuses the copy (asked twice) and lets
-# this shell's settings through, i.e. when net-refresh helps. Sets PROBE_NOTE to the codes seen.
+# Where the service's proxy settings come from. On Muse's VM every shell (each login, each run of a Muse
+# cron job) gets its own proxy credentials, and a cron run's are refused (407) within minutes of the run;
+# /etc/environment holds the ones written when the VM booted, and those kept working (2026-10-25, opencode
+# kit: a copy from a cron run was refused 4 minutes later, /etc/environment's still passed 80 minutes after
+# boot). So /etc/environment's win when its proxy gets through; this shell's otherwise.
+NET_SOURCE="this shell"
+etc_env_get() { sed -n "s/^$1=//p" /etc/environment 2>/dev/null | tail -n 1 | sed 's/^"//; s/"$//'; }
+
+# Export /etc/environment's NET_VARS over this shell's when its proxy gets through (1 otherwise). A proxy
+# variable /etc/environment lacks (all_proxy, say) is dropped rather than kept from this shell, whose
+# credentials are the ones that expire.
+use_etc_environment() {
+  local p name value
+  p="$(etc_env_get https_proxy)"; [ -n "$p" ] || p="$(etc_env_get HTTPS_PROXY)"
+  [ -n "$p" ] || return 1
+  if command -v curl >/dev/null 2>&1; then proxy_passes "$(proxy_codes "$p")" || return 1; fi
+  for name in $NET_VARS; do
+    value="$(etc_env_get "$name")"
+    if [ -n "$value" ]; then export "$name=$value"
+    else case "$name" in no_proxy|NO_PROXY) ;; *_proxy|*_PROXY) unset "$name" ;; esac; fi
+  done
+  NET_SOURCE=/etc/environment
+}
+
+# The copy in the env file can stop working. The running bot does not notice on Slack (its socket was
+# opened earlier), but every new connection (each model call, web search, GitHub) is refused. 0 when the
+# proxy refuses the copy (asked twice) and lets other settings through — /etc/environment's, or this
+# shell's — which are then exported for net-refresh. Sets PROBE_NOTE to the codes seen.
 env_proxy_stale() {
   command -v curl >/dev/null 2>&1 || return 1
   local f s env_codes shell_codes
   f="$(env_get https_proxy)"; [ -n "$f" ] || f="$(env_get HTTPS_PROXY)"
-  s="${https_proxy:-${HTTPS_PROXY:-}}"
-  [ -n "$f" ] && [ -n "$s" ] && [ "$f" != "$s" ] || return 1
+  [ -n "$f" ] || return 1
   env_codes="$(proxy_codes "$f")"
   proxy_refused "$env_codes" || return 1
   sleep 3
   env_codes="$(proxy_codes "$f")"
   proxy_refused "$env_codes" || return 1
+  if use_etc_environment; then PROBE_NOTE="env file's: CONNECT/HTTP $env_codes; /etc/environment's pass"; return 0; fi
+  s="${https_proxy:-${HTTPS_PROXY:-}}"
+  [ -n "$s" ] && [ "$s" != "$f" ] || return 1
   shell_codes="$(proxy_codes "$s")"
   PROBE_NOTE="env file's: CONNECT/HTTP $env_codes; this shell's: $shell_codes"
   proxy_passes "$shell_codes"
@@ -401,10 +427,11 @@ EOF
   [ -f "$DSK_HOME/env.local" ] && cat "$DSK_HOME/env.local" >> "$ENV_FILE"
   # A service starts without this shell's proxy settings. Where direct egress is blocked (Muse's VM
   # answers https on :443 with plain text) DSH then reaches neither Slack nor the models.
+  use_etc_environment || true
   write_net_env "$ENV_FILE"
   chmod 600 "$ENV_FILE"
   say "supervisor: $mode"
-  if [ "${#NET_NAMES[@]}" -gt 0 ]; then say "network settings taken from this shell (values not shown): ${NET_NAMES[*]}"
+  if [ "${#NET_NAMES[@]}" -gt 0 ]; then say "network settings taken from $NET_SOURCE (values not shown): ${NET_NAMES[*]}"
   else say "no proxy settings in this shell: the service connects directly"; fi
 
   step "DSH home ($DSH_HOME_DIR) and the slack profile"
@@ -459,7 +486,7 @@ cmd_import() {
 # only, never a value.
 cmd_netcheck() {
   [ -f "$ENV_FILE" ] || die "$ENV_FILE not found — run: $SELF install"
-  local v s f label c rc out tried=" " any=0
+  local v s f e label c rc out tried=" " any=0
   step "proxy settings: this shell vs $ENV_FILE"
   for v in https_proxy HTTPS_PROXY http_proxy HTTP_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY; do
     s="${!v-}"
@@ -473,14 +500,23 @@ cmd_netcheck() {
     else out="DIFFERENT"; fi
     case "$s" in *://*@*) out="$out; shell value has user:pass@" ;; esac
     case "$f" in *://*@*) out="$out; env file value has user:pass@" ;; esac
+    e="$(etc_env_get "$v")"
+    if [ -z "$e" ]; then out="$out; not in /etc/environment"
+    elif [ "$e" = "$f" ]; then out="$out; /etc/environment = env file"
+    elif [ "$e" = "$s" ]; then out="$out; /etc/environment = shell"
+    else out="$out; /etc/environment differs from both"; fi
     say "$v: $out"
   done
   [ "$any" = 1 ] || say "no proxy settings in this shell or the env file"
 
   step "CONNECT through each proxy (slack.com, api.github.com, integrate.api.nvidia.com)"
   for v in https_proxy HTTPS_PROXY all_proxy ALL_PROXY; do
-    for label in shell envfile; do
-      if [ "$label" = shell ]; then s="${!v-}"; else s="$(sed -n "s/^$v=//p" "$ENV_FILE" | tail -n 1)"; s="${s#\"}"; s="${s%\"}"; fi
+    for label in shell envfile etc-environment; do
+      case "$label" in
+        shell) s="${!v-}" ;;
+        envfile) s="$(sed -n "s/^$v=//p" "$ENV_FILE" | tail -n 1)"; s="${s#\"}"; s="${s%\"}" ;;
+        *) s="$(etc_env_get "$v")" ;;
+      esac
       [ -n "$s" ] || continue
       case "$tried" in *" $label:$v "*) continue ;; esac
       tried="$tried$label:$v "
@@ -502,13 +538,14 @@ cmd_netcheck() {
 cmd_net_refresh() {
   [ -f "$ENV_FILE" ] || die "$ENV_FILE not found — run: $SELF install"
   local name names="" tmp="$ENV_FILE.tmp"
+  use_etc_environment || true
   shell_has_proxy || die "this shell has no proxy settings — run this from the shell whose proxy works; $ENV_FILE left as it is"
   for name in $NET_VARS; do names="$names|$name"; done
   grep -vE "^(${names#|})=" "$ENV_FILE" > "$tmp" || true
   write_net_env "$tmp"
   chmod 600 "$tmp"
   mv "$tmp" "$ENV_FILE"
-  say "network settings taken from this shell (values not shown): ${NET_NAMES[*]}"
+  say "network settings taken from $NET_SOURCE (values not shown): ${NET_NAMES[*]}"
   if [ -f "$DSK_HOME/wanted" ]; then cmd_restart; else say "the bot is not started; nothing to restart"; fi
 }
 
@@ -585,20 +622,21 @@ cmd_start_saved() {
   mkdir -p "$LOG_DIR"
   since="$(date -u +%FT%T)"
   if [ -f "$ENV_FILE" ] && service_running; then
-    if env_proxy_stale; then why="the proxy refuses the env file's settings and lets this shell's through ($PROBE_NOTE)"
+    if env_proxy_stale; then why="the proxy refuses the env file's settings ($PROBE_NOTE)"
     elif socket_failing; then why="the bot cannot reach Slack (last socket attempts failed)"
     else say "start-saved: running — nothing to do"; return 0; fi
     shell_has_proxy || die_saved "start-saved: $why and this shell has no proxy settings to give it"
-    record "start-saved: RESTARTING — $why; taking this shell's proxy settings"
+    record "start-saved: RESTARTING — $why; taking $NET_SOURCE's proxy settings"
     cmd_net_refresh
   else
+    use_etc_environment || true
     if ! shell_has_proxy && env_has_proxy; then
       record "start-saved: RECOVERING — the bot should run but does not; this shell has no proxy settings, so the env file's are kept"
       load_env
       [ -x "$DSK_NODE" ] && [ -f "$DSH_JS" ] || die_saved "start-saved: Node or the dsh CLI is gone, and this shell has no proxy settings to download them"
       [ "$(supervisor)" = manual ] || [ -f "$(unit_path)" ] || write_unit "$(supervisor)"
     else
-      record "start-saved: RECOVERING — the bot should run but does not; install again (configs, secrets and sessions kept; log $LOG_DIR/start-saved.log), then start"
+      record "start-saved: RECOVERING — the bot should run but does not; install again (configs, secrets and sessions kept, proxy settings from $NET_SOURCE; log $LOG_DIR/start-saved.log), then start"
       if ! "$SELF" install > "$LOG_DIR/start-saved.log" 2>&1; then
         scrub < "$LOG_DIR/start-saved.log" | tail -n 15
         die_saved "start-saved: install failed"

@@ -34,8 +34,12 @@ Mac の DSH はそのまま動かしておく。**2026-10-25: VM の `check` は
   （依頼文 2b）。Claude ボットのキットと同じ形:
   - `start --cutover` の前、または `stop` の後（`~/.dsh-slack/wanted` が無い）→ 何もしない
   - 動いていて Slack につながっている → 何もしない
-  - 動いていない → `install` をやり直して（設定・秘密・セッション・入れた DSH はそのまま。プロキシ変数は cron のシェルから）起動
-  - 動いているが、env ファイルのプロキシがトンネルを断り、cron のシェルのプロキシは通る → `net-refresh`（プロキシ行を書き直して再起動）
+  - 動いていない → `install` をやり直して（設定・秘密・セッション・入れた DSH はそのまま）起動
+  - 動いているが、env ファイルのプロキシがトンネルを断り、ほかの設定（下）なら通る → `net-refresh`（プロキシ行を書き直して再起動）
+  - サービスに渡すプロキシ設定は、`/etc/environment` のものが通ればそれ、通らなければ実行したシェルのもの（`install` /
+    `net-refresh` / `start-saved` 共通）。Muse の cron の実行ごとのシェルの認証情報は数分で断られ（407）、`/etc/environment`
+    のもの（VM の起動時に書かれる）は 80 分以上通った（2026-10-25、opencode キットで実測）。シェルのものを写すと、次の cron で
+    また写し直す再起動の繰り返しになる（opencode ボットで 10 分ごとに起きた）。
   - 動いているが、直近 3 回の Slack ソケット接続がすべて失敗 → `net-refresh`
   - `start` / `stop` とロック（`~/.dsh-slack/.lock`）を共有するので、人の `stop` とぶつからない。動いたときの記録は
     `~/.dsh-slack/logs/start-saved.history`（`status` が最後の 5 件を出す）。再起動は動いているターンを中断する（キューには戻る）。
@@ -150,8 +154,9 @@ check の出力をそのまま返信してください（秘密の値は出ま�
 - `✓ model nvidia/z-ai/glm-5.3-flash — answered OK in 169 s`
 - `· GitHub CLI — logged in as azumag` / `· git user.name — not set`（依頼文 2b で設定する）
 
-プロキシ設定が古くなる件は、`start-saved` が env ファイルのプロキシを試して、断られていれば cron のシェルの設定で
-`net-refresh` する（上の「VM で動くもの」）。どのくらいの間隔で古くなるかは未確認。
+プロキシ設定が古くなる件は、`start-saved` が env ファイルのプロキシを試して、断られていれば `/etc/environment` の設定
+（通るとき）か cron のシェルの設定で `net-refresh` する（上の「VM で動くもの」）。cron のシェルの認証情報は数分で断られ、
+`/etc/environment` のものは長く通る（opencode キットでの実測）。DSH のサービスで効くかは VM で未確認。
 
 ## 依頼文 2b（名義と自動復旧の cron。ボットはまだ起動しない）
 

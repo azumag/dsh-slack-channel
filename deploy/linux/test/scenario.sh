@@ -314,6 +314,35 @@ $REPO/deploy/linux/setup.sh status > /tmp/status-history.log 2>&1
 grep -A5 'start-saved acted' /tmp/status-history.log | grep -c 'start-saved:' | grep -q '^[3-5]$' && pass "status shows the start-saved history" || { fail "no start-saved history in status"; cat /tmp/status-history.log; }
 leak_check /tmp/ss1.log /tmp/ss2.log /tmp/ss3.log /tmp/ss4.log /tmp/ss6.log /tmp/status-lost.log /tmp/status-history.log $DSK/logs/start-saved.log $DSK/logs/start-saved.history
 
+section "/etc/environment's proxy wins when it gets through (a cron run's credentials expire within minutes)"
+# On Muse's VM a cron run's proxy credentials are refused minutes later, /etc/environment's (written at
+# boot) keep working. Two spellings of the one working proxy tell the sources apart: the shell has
+# http://127.0.0.1:8888, /etc/environment http://127.0.0.1:8888/.
+ETC_PROXY=http://127.0.0.1:8888/
+cp /etc/environment /tmp/environment.orig
+printf 'https_proxy="%s"\nhttp_proxy="%s"\nHTTPS_PROXY="%s"\nHTTP_PROXY="%s"\n' $ETC_PROXY $ETC_PROXY $ETC_PROXY $ETC_PROXY >> /etc/environment
+muse $REPO/deploy/linux/setup.sh install > /tmp/install-etc.log 2>&1 || fail "install exit $?"
+grep -q 'network settings taken from /etc/environment' /tmp/install-etc.log && grep -qx "https_proxy=\"$ETC_PROXY\"" $DSK/env &&
+  pass "install took /etc/environment's proxy" || { fail "install did not take /etc/environment's proxy"; tail -n 20 /tmp/install-etc.log; }
+grep -qE '^(all_proxy|ALL_PROXY)=' $DSK/env && fail "the shell's all_proxy came along" || pass "no proxy variable from the shell (its credentials expire)"
+start_refuser
+point_env_proxy_at 8890
+muse $REPO/deploy/linux/setup.sh start-saved > /tmp/ss7.log 2>&1 && pass "start-saved (refused copy, /etc/environment passes)" || fail "start-saved (refused copy, /etc/environment passes) exit $?"
+cat /tmp/ss7.log
+grep -q "/etc/environment's pass); taking /etc/environment's proxy settings" /tmp/ss7.log && grep -q 'start-saved: done' /tmp/ss7.log &&
+  grep -qx "https_proxy=\"$ETC_PROXY\"" $DSK/env && pass "restarted with /etc/environment's proxy" || fail "did not take /etc/environment's proxy"
+muse $REPO/deploy/linux/setup.sh start-saved > /tmp/ss8.log 2>&1
+grep -q 'start-saved: running — nothing to do' /tmp/ss8.log && pass "the next run leaves it alone (no restart loop)" || { fail "the next run acted"; cat /tmp/ss8.log; }
+# /etc/environment's proxy refused too → this shell's settings, as before.
+sed -i -E "s#^(https?_proxy|HTTPS?_PROXY)=.*#\1=\"http://127.0.0.1:8890\"#" /etc/environment
+point_env_proxy_at 8890
+muse $REPO/deploy/linux/setup.sh start-saved > /tmp/ss9.log 2>&1 && pass "start-saved (both refused)" || fail "start-saved (both refused) exit $?"
+stop_refuser
+cat /tmp/ss9.log
+grep -q "this shell's: 200 .*taking this shell's proxy settings" /tmp/ss9.log && grep -qx "https_proxy=\"$PROXY\"" $DSK/env &&
+  pass "fell back to this shell's proxy" || fail "no fallback to this shell's proxy"
+cp /tmp/environment.orig /etc/environment
+
 section "logs and status hide a proxy password that a library put in an error"
 echo "$(date -u +%FT%T.000Z) WARN [slack-channel] chat.postMessage failed: tunnel via http://muse:PROXYPW-scrub-test@hatch-egress-proxy:3128 refused (407)" >> $DSK/logs/dsh.log
 $REPO/deploy/linux/setup.sh logs 5 > /tmp/logs-scrub.log 2>&1
