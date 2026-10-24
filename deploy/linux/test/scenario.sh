@@ -286,9 +286,20 @@ grep -q 'install again' /tmp/ss3.log && grep -q 'start-saved: done' /tmp/ss3.log
 grep -q 'already installed' $DSK/logs/start-saved.log && pass "the installed dsh CLI was kept" || fail "dsh CLI installed anew"
 systemctl is-enabled --quiet dsh-slack.service && pass "enabled again" || fail "not enabled"
 
-section "start-saved: running, but the proxy copy is refused → net-refresh + restart"
+section "start-saved: socket still up, but the proxy refuses the env file's copy → net-refresh + restart"
+# The DSH case: Slack's socket was opened with the old credentials and stays up, every new connection
+# (model calls, web search) is refused.
 start_refuser
 point_env_proxy_at 8890
+muse $REPO/deploy/linux/setup.sh start-saved > /tmp/ss4.log 2>&1 && pass "start-saved (refused copy)" || fail "start-saved (refused copy) exit $?"
+stop_refuser
+cat /tmp/ss4.log
+grep -q "start-saved: RESTARTING — the proxy refuses the env file's settings" /tmp/ss4.log && grep -q 'CONNECT/HTTP 407' /tmp/ss4.log && pass "the refused copy was found (407) while the socket was up" || fail "the refused copy was not found"
+grep -q 'start-saved: done' /tmp/ss4.log && pass "restarted and connected again" || fail "not connected after the refresh"
+grep -q '127.0.0.1:8890' $DSK/env && fail "the refused proxy is still in the env file" || pass "env file has the shell's proxy again"
+
+section "start-saved: the proxy in the env file is unreachable, the socket keeps failing → net-refresh + restart"
+point_env_proxy_at 8889
 systemctl restart dsh-slack.service
 since="$(date -u +%FT%T)"
 for _ in $(seq 1 60); do
@@ -296,12 +307,12 @@ for _ in $(seq 1 60); do
   sleep 2
 done
 grep 'apps.connections.open failed' $DSK/logs/dsh.log | tail -n 1 | cut -c1-200
-muse $REPO/deploy/linux/setup.sh start-saved > /tmp/ss4.log 2>&1 && pass "start-saved (refused proxy)" || fail "start-saved (refused proxy) exit $?"
-stop_refuser
-cat /tmp/ss4.log
-grep -q 'start-saved: RESTARTING' /tmp/ss4.log && grep -q 'start-saved: done' /tmp/ss4.log && pass "net-refresh + restart, connected again" || fail "no recovery from a refused proxy"
-grep -q '127.0.0.1:8890' $DSK/env && fail "the refused proxy is still in the env file" || pass "env file has the shell's proxy again"
-leak_check /tmp/ss1.log /tmp/ss2.log /tmp/ss3.log /tmp/ss4.log /tmp/status-lost.log $DSK/logs/start-saved.log
+muse $REPO/deploy/linux/setup.sh start-saved > /tmp/ss6.log 2>&1 && pass "start-saved (failing socket)" || fail "start-saved (failing socket) exit $?"
+cat /tmp/ss6.log
+grep -q 'start-saved: RESTARTING — the bot cannot reach Slack' /tmp/ss6.log && grep -q 'start-saved: done' /tmp/ss6.log && pass "failing socket found, connected again" || fail "no recovery from a failing socket"
+$REPO/deploy/linux/setup.sh status > /tmp/status-history.log 2>&1
+grep -A5 'start-saved acted' /tmp/status-history.log | grep -c 'start-saved:' | grep -q '^[3-5]$' && pass "status shows the start-saved history" || { fail "no start-saved history in status"; cat /tmp/status-history.log; }
+leak_check /tmp/ss1.log /tmp/ss2.log /tmp/ss3.log /tmp/ss4.log /tmp/ss6.log /tmp/status-lost.log /tmp/status-history.log $DSK/logs/start-saved.log $DSK/logs/start-saved.history
 
 section "stop"
 $REPO/deploy/linux/setup.sh stop

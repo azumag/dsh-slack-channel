@@ -310,6 +310,41 @@ socket_failing() {
 
 connected_since() { grep -q 'socket connected' <<<"$(socket_lines "$1")"; }
 
+# A variable's value in the env file (quotes removed), empty when absent.
+env_get() { local v; v="$(sed -n "s/^$1=//p" "$ENV_FILE" 2>/dev/null | tail -n 1)"; v="${v#\"}"; printf '%s' "${v%\"}"; }
+
+# "<CONNECT code> <HTTP code>" of a request to Slack through proxy $1 (000: none).
+proxy_codes() { curl -s -o /dev/null --max-time 20 -x "$1" -w '%{http_connect} %{http_code}' https://slack.com/api/api.test 2>/dev/null || true; }
+
+# The proxy itself said no: 401/403/407 to the CONNECT. A timeout or an error from Slack is not a refusal:
+# re-copying the settings would not help, so it must not cause a restart.
+proxy_refused() { case "$1" in 401\ *|403\ *|407\ *) return 0 ;; esac; return 1; }
+proxy_passes() { case "$1" in 200\ *) return 0 ;; esac; return 1; }
+
+# Muse's VM hands each shell new proxy credentials, and the copy in the env file can stop working. The
+# running bot does not notice on Slack (its socket was opened earlier), but every new connection (each
+# model call, web search, GitHub) is refused. 0 when the proxy refuses the copy (asked twice) and lets
+# this shell's settings through, i.e. when net-refresh helps. Sets PROBE_NOTE to the codes seen.
+env_proxy_stale() {
+  command -v curl >/dev/null 2>&1 || return 1
+  local f s env_codes shell_codes
+  f="$(env_get https_proxy)"; [ -n "$f" ] || f="$(env_get HTTPS_PROXY)"
+  s="${https_proxy:-${HTTPS_PROXY:-}}"
+  [ -n "$f" ] && [ -n "$s" ] && [ "$f" != "$s" ] || return 1
+  env_codes="$(proxy_codes "$f")"
+  proxy_refused "$env_codes" || return 1
+  sleep 3
+  env_codes="$(proxy_codes "$f")"
+  proxy_refused "$env_codes" || return 1
+  shell_codes="$(proxy_codes "$s")"
+  PROBE_NOTE="env file's: CONNECT/HTTP $env_codes; this shell's: $shell_codes"
+  proxy_passes "$shell_codes"
+}
+
+# A start-saved line, also kept in $LOG_DIR/start-saved.history (how often it had to act, and why).
+record() { say "$*"; printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >> "$LOG_DIR/start-saved.history" 2>/dev/null || true; }
+die_saved() { record "error: $*" >&2; exit 1; }
+
 # Log lines with DSH's local web-server token masked (the URL line carries ?token=…).
 masked_log() { sed -E 's/([?&]token=)[A-Za-z0-9_-]+/\1<hidden>/g' "$LOG_FILE"; }
 
@@ -532,34 +567,39 @@ cmd_start() {
 # stopped since ($DSK_HOME/wanted), using only what survives in $DSK_HOME. Prints "start-saved:" lines
 # saying what it did; exit 1 only when it tried and failed.
 #  - not wanted: nothing. A stopped bot stays stopped.
-#  - wanted, running, Slack's socket not failing: nothing.
+#  - wanted, running, Slack's socket not failing, the env file's proxy settings accepted: nothing.
 #  - wanted, not running (machine re-created: the unit in /etc is gone): install again with this shell's
 #    proxy settings (configs, secrets and sessions kept), then start. A shell without proxy settings keeps
 #    the env file's and only writes the unit again.
-#  - wanted, running, the last socket attempts all failed: take this shell's proxy settings and restart.
+#  - wanted, running, but the proxy refuses the env file's settings while this shell's get through, or the
+#    last socket attempts since it started all failed: take this shell's proxy settings and restart (running
+#    turns are interrupted and queued again).
 cmd_start_saved() {
-  local since _
+  local since why _
+  [ -d "$DSK_HOME" ] || die "start-saved: $DSK_HOME not found — run it as the user who installed the bot (HOME=$HOME)"
   [ -f "$DSK_HOME/wanted" ] || { say "start-saved: not wanted (stopped, or never started with --cutover) — nothing to do"; return 0; }
   lock_kit 5 || { say "start-saved: another start/stop/start-saved is running — nothing to do"; return 0; }
   [ -f "$DSK_HOME/wanted" ] || { say "start-saved: stopped meanwhile — nothing to do"; return 0; }
+  mkdir -p "$LOG_DIR"
+  since="$(date -u +%FT%T)"
   if [ -f "$ENV_FILE" ] && service_running; then
-    socket_failing || { say "start-saved: running — nothing to do"; return 0; }
-    shell_has_proxy || die "start-saved: the bot cannot reach Slack (last socket attempts failed) and this shell has no proxy settings to give it"
-    say "start-saved: RESTARTING — the bot cannot reach Slack (last socket attempts failed); taking this shell's proxy settings"
-    since="$(date -u +%FT%T)"
+    if env_proxy_stale; then why="the proxy refuses the env file's settings and lets this shell's through ($PROBE_NOTE)"
+    elif socket_failing; then why="the bot cannot reach Slack (last socket attempts failed)"
+    else say "start-saved: running — nothing to do"; return 0; fi
+    shell_has_proxy || die_saved "start-saved: $why and this shell has no proxy settings to give it"
+    record "start-saved: RESTARTING — $why; taking this shell's proxy settings"
     cmd_net_refresh
   else
-    since="$(date -u +%FT%T)"
     if ! shell_has_proxy && env_has_proxy; then
-      say "start-saved: RECOVERING — the bot should run but does not; this shell has no proxy settings, so the env file's are kept"
+      record "start-saved: RECOVERING — the bot should run but does not; this shell has no proxy settings, so the env file's are kept"
       load_env
-      [ -x "$DSK_NODE" ] && [ -f "$DSH_JS" ] || die "start-saved: Node or the dsh CLI is gone, and this shell has no proxy settings to download them"
+      [ -x "$DSK_NODE" ] && [ -f "$DSH_JS" ] || die_saved "start-saved: Node or the dsh CLI is gone, and this shell has no proxy settings to download them"
       [ "$(supervisor)" = manual ] || [ -f "$(unit_path)" ] || write_unit "$(supervisor)"
     else
-      say "start-saved: RECOVERING — the bot should run but does not; install again (configs, secrets and sessions kept; log $LOG_DIR/start-saved.log), then start"
+      record "start-saved: RECOVERING — the bot should run but does not; install again (configs, secrets and sessions kept; log $LOG_DIR/start-saved.log), then start"
       if ! "$SELF" install > "$LOG_DIR/start-saved.log" 2>&1; then
         tail -n 15 "$LOG_DIR/start-saved.log"
-        die "start-saved: install failed"
+        die_saved "start-saved: install failed"
       fi
       load_env
     fi
@@ -567,9 +607,9 @@ cmd_start_saved() {
   fi
   for _ in $(seq 1 60); do connected_since "$since" && break; sleep 2; done
   socket_lines "$since" | tail -n 3
-  service_running || die "start-saved: the bot is not running after the start"
-  connected_since "$since" || die "start-saved: started, but Slack's socket did not connect within 120 s"
-  say "start-saved: done — the bot is running and connected to Slack"
+  service_running || die_saved "start-saved: the bot is not running after the start"
+  connected_since "$since" || die_saved "start-saved: started, but Slack's socket did not connect within 120 s"
+  record "start-saved: done — the bot is running and connected to Slack"
 }
 
 cmd_stop() {
@@ -597,6 +637,7 @@ cmd_status() {
     [ "$(supervisor)" = manual ] || [ -f "$(unit_path)" ] || say "service unit: MISSING ($(unit_path)) — run: $SELF start-saved"
   else say "started with --cutover: no"; fi
   say "last Slack socket attempts: $(socket_lines | tail -n 3 | tr '\n' ';' | sed 's/;$//; s/;/; /g')"
+  if [ -s "$LOG_DIR/start-saved.history" ]; then say "start-saved acted (last 5, UTC):"; tail -n 5 "$LOG_DIR/start-saved.history"; fi
   [ -f "$SLACK_FILE" ] && say "Slack tokens: present" || say "Slack tokens: missing (keygen + import)"
   if [ -f "$LOG_FILE" ]; then
     say "--- last Slack channel lines"
