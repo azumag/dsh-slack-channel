@@ -314,6 +314,14 @@ $REPO/deploy/linux/setup.sh status > /tmp/status-history.log 2>&1
 grep -A5 'start-saved acted' /tmp/status-history.log | grep -c 'start-saved:' | grep -q '^[3-5]$' && pass "status shows the start-saved history" || { fail "no start-saved history in status"; cat /tmp/status-history.log; }
 leak_check /tmp/ss1.log /tmp/ss2.log /tmp/ss3.log /tmp/ss4.log /tmp/ss6.log /tmp/status-lost.log /tmp/status-history.log $DSK/logs/start-saved.log $DSK/logs/start-saved.history
 
+section "logs and status hide a proxy password that a library put in an error"
+echo "$(date -u +%FT%T.000Z) WARN [slack-channel] chat.postMessage failed: tunnel via http://muse:PROXYPW-scrub-test@hatch-egress-proxy:3128 refused (407)" >> $DSK/logs/dsh.log
+$REPO/deploy/linux/setup.sh logs 5 > /tmp/logs-scrub.log 2>&1
+$REPO/deploy/linux/setup.sh status > /tmp/status-scrub.log 2>&1
+grep -q 'http://<hidden>@hatch-egress-proxy' /tmp/logs-scrub.log && grep -q 'http://<hidden>@hatch-egress-proxy' /tmp/status-scrub.log &&
+  ! grep -q 'PROXYPW-scrub-test' /tmp/logs-scrub.log /tmp/status-scrub.log && pass "proxy password hidden in logs and status" ||
+  { fail "proxy password shown"; cat /tmp/logs-scrub.log /tmp/status-scrub.log; }
+
 section "stop"
 $REPO/deploy/linux/setup.sh stop
 systemctl is-active --quiet dsh-slack.service && fail "still running" || pass "stopped"

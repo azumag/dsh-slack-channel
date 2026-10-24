@@ -345,8 +345,10 @@ env_proxy_stale() {
 record() { say "$*"; printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >> "$LOG_DIR/start-saved.history" 2>/dev/null || true; }
 die_saved() { record "error: $*" >&2; exit 1; }
 
-# Log lines with DSH's local web-server token masked (the URL line carries ?token=…).
-masked_log() { sed -E 's/([?&]token=)[A-Za-z0-9_-]+/\1<hidden>/g' "$LOG_FILE"; }
+# Text from logs with DSH's local web-server token masked (the URL line carries ?token=…) and the user:password
+# of any URL hidden: the service's proxy settings carry credentials, and some libraries put the proxy URL in errors.
+scrub() { sed -E 's/([?&]token=)[A-Za-z0-9_-]+/\1<hidden>/g; s#(://)[^/@[:space:]]+@#\1<hidden>@#g'; }
+masked_log() { scrub < "$LOG_FILE"; }
 
 # ---------------------------------------------------------------- commands
 
@@ -554,13 +556,13 @@ cmd_start() {
   # connection; a bad token or no route to Slack shows up as warnings instead.
   for _ in $(seq 1 45); do
     sleep 2
-    found="$(tail -c +"$((from + 1))" "$LOG_FILE" 2>/dev/null | grep -E 'own identity resolved|socket connected|apps.connections.open failed|socket connect failed|socket closed|socket loop crashed|slack-channel: no (bot|app) token' | head -n 4 || true)"
+    found="$(tail -c +"$((from + 1))" "$LOG_FILE" 2>/dev/null | scrub | grep -E 'own identity resolved|socket connected|apps.connections.open failed|socket connect failed|socket closed|socket loop crashed|slack-channel: no (bot|app) token' | head -n 4 || true)"
     grep -qE 'socket connected|failed|socket closed|crashed|no (bot|app) token' <<<"$found" && break
   done
   say "--- Slack channel"
   if [ -n "$found" ]; then say "$found"; else say "no Slack channel line yet after 90 s"; fi
   say "--- last log lines"
-  tail -c +"$((from + 1))" "$LOG_FILE" 2>/dev/null | sed -E 's/([?&]token=)[A-Za-z0-9_-]+/\1<hidden>/g' | tail -n 12
+  tail -c +"$((from + 1))" "$LOG_FILE" 2>/dev/null | scrub | tail -n 12
 }
 
 # For cron (every few minutes) or @reboot: bring back a bot that was started with start --cutover and not
@@ -598,7 +600,7 @@ cmd_start_saved() {
     else
       record "start-saved: RECOVERING — the bot should run but does not; install again (configs, secrets and sessions kept; log $LOG_DIR/start-saved.log), then start"
       if ! "$SELF" install > "$LOG_DIR/start-saved.log" 2>&1; then
-        tail -n 15 "$LOG_DIR/start-saved.log"
+        scrub < "$LOG_DIR/start-saved.log" | tail -n 15
         die_saved "start-saved: install failed"
       fi
       load_env
