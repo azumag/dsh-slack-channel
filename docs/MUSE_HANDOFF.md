@@ -246,6 +246,7 @@ Mac で最後まで処理して返信する（返信は Web API なので、ソ�
 `own identity resolved (… user_id=U0C9C7BNVB5)`、`socket connected (num_connections=2)`、プロキシは /etc/environment のもの）。
 02:55:13 に Mac で `touch ~/.dsh/slack-state.receive-off` → 02:55:26 までに Mac の DSH から Slack（wss-primary）への接続が消え、
 drain.json は running 1 件・waiting 28 件。owner の判断で、28 件は時間がかかっても Mac で最後まで処理する。
+~02:57 owner が DSH にメンションして返事を確認（その時点でも Mac に Slack への接続は無く、drain.json も変わらず → 返事は VM から）。
 
 ### Mac: Slack チャンネルを止める
 
