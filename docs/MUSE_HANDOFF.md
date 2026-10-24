@@ -118,7 +118,8 @@ check の出力をそのまま返信してください（秘密の値は出ま�
 - `· git user.name — …`: ボットのコミットの名義。未設定なら
   `setup.sh git-identity "azumag" azumag@users.noreply.github.com`（`~/.gitconfig` は変えない）。
 - `· network — proxy settings: …`: サービスの環境にあるプロキシ変数の名前。check はサービスと同じ環境（env ファイルだけ）で走る。
-  プロキシで失敗したら `setup.sh netcheck` の出力を返してもらう。
+  プロキシで失敗したら `setup.sh netcheck` の出力を返してもらう。シェルとサービスでプロキシ設定が違う（`DIFFERENT`）なら、
+  プロキシが効いているシェルで `setup.sh net-refresh`（env ファイルのプロキシ行だけ書き直し、起動済みなら再起動。値は出ない）。
 
 ### bubblewrap を入れる（`✗ command sandbox` のときだけ。VM のシステムパッケージなので owner の OK を取ってから）
 

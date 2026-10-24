@@ -31,7 +31,9 @@ const errText = (error) => {
   const cause = error?.cause
   // Node's fetch through a proxy that answers CONNECT with anything but 200 (407, 403, …) fails as
   // "Request was cancelled." with code 0.
-  if (cause?.code === 0 && proxied) return (error?.message ?? String(error)) + ' (the proxy refused the tunnel — run setup.sh netcheck)'
+  if (cause?.code === 0 && proxied) return (error?.message ?? String(error)) + ' (the proxy refused the tunnel — run setup.sh netcheck, then net-refresh from the shell whose proxy works)'
+  // Through a proxy the connection (and the name lookup) is the proxy's, so these mean the proxy itself.
+  if (['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN'].includes(cause?.code) && proxied) return (error?.message ?? String(error)) + ' (' + cause.code + ': the proxy in the service environment is unreachable — run setup.sh netcheck, then net-refresh from the shell whose proxy works)'
   return (error?.message ?? String(error)) + (cause ? ' (' + (cause.code ?? cause.message) + ')' : '')
 }
 /** A tool's error line without URLs, user:pass@, host:port or token-looking strings. */

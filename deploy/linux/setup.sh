@@ -8,6 +8,7 @@
 #   deploy/linux/setup.sh import <blob>      open the sealed secrets (Slack tokens + model API keys)
 #   deploy/linux/setup.sh check [--no-model|--all-routes]   verify everything without connecting to Slack's socket
 #   deploy/linux/setup.sh netcheck           compare this shell's proxy settings with the service's
+#   deploy/linux/setup.sh net-refresh        copy this shell's proxy settings to the service again (restarts it)
 #   deploy/linux/setup.sh git-identity "<name>" <email>   who the bot's commits are by (not ~/.gitconfig)
 #   deploy/linux/setup.sh start --cutover    start DSH with the Slack channel (only once the old bot is stopped)
 #   deploy/linux/setup.sh stop | restart | status | logs [N] | uninstall
@@ -406,6 +407,22 @@ cmd_netcheck() {
   if [ -n "$out" ]; then say "$out"; else say "none of the usual profile files set them (the environment that runs this shell does)"; fi
 }
 
+# Copy this shell's proxy and CA settings into the env file again, replacing only those lines (for when
+# the shell's proxy settings changed after install), and restart the bot if it was started. Names only.
+cmd_net_refresh() {
+  [ -f "$ENV_FILE" ] || die "$ENV_FILE not found — run: $SELF install"
+  local name names="" proxy="" tmp="$ENV_FILE.tmp"
+  for name in https_proxy HTTPS_PROXY http_proxy HTTP_PROXY all_proxy ALL_PROXY; do [ -n "${!name:-}" ] && proxy=1; done
+  [ -n "$proxy" ] || die "this shell has no proxy settings — run this from the shell whose proxy works; $ENV_FILE left as it is"
+  for name in $NET_VARS; do names="$names|$name"; done
+  grep -vE "^(${names#|})=" "$ENV_FILE" > "$tmp" || true
+  write_net_env "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$ENV_FILE"
+  say "network settings taken from this shell (values not shown): ${NET_NAMES[*]}"
+  if [ -f "$DSK_HOME/wanted" ]; then cmd_restart; else say "the bot is not started; nothing to restart"; fi
+}
+
 # The bot's commits only: GIT_AUTHOR_*/GIT_COMMITTER_* in the env file. ~/.gitconfig is not touched,
 # so whoever else uses git on this machine keeps their own identity.
 cmd_git_identity() {
@@ -514,6 +531,7 @@ case "${1:-}" in
   import) shift; cmd_import "$@" ;;
   check) shift; cmd_check "$@" ;;
   netcheck) cmd_netcheck ;;
+  net-refresh) cmd_net_refresh ;;
   git-identity) shift; cmd_git_identity "$@" ;;
   start) shift; cmd_start "$@" ;;
   start-saved) cmd_start_saved ;;
@@ -522,5 +540,5 @@ case "${1:-}" in
   status) cmd_status ;;
   logs) shift; cmd_logs "$@" ;;
   uninstall) cmd_uninstall ;;
-  *) sed -n '2,20p' "$SELF" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,21p' "$SELF" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

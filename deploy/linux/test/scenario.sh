@@ -166,6 +166,23 @@ for h in integrate.api.nvidia.com opencode.ai api.deepseek.com; do
 done
 grep -q '"ws":"connected"' $LOG && fail "check opened the Slack socket" || pass "check did not open the Slack socket"
 
+section "net-refresh: a stale proxy copy in the env file"
+envsum() { grep -vE '^(https?|all|no|HTTPS?|ALL|NO)_(proxy|PROXY)=|^NODE_USE_ENV_PROXY=' $DSK/env | sha256sum; }
+others_before="$(envsum)"
+sed -i -E 's#^(https?_proxy|HTTPS?_PROXY|all_proxy|ALL_PROXY)=.*#\1="http://127.0.0.1:8889"#' $DSK/env
+$REPO/deploy/linux/setup.sh check --no-model > /tmp/check-stale.log 2>&1 && fail "check passed with a dead proxy" || pass "check fails with a dead proxy in the env file"
+grep -m1 'Slack Web API\|Slack bot token' /tmp/check-stale.log
+grep -q 'proxy in the service environment is unreachable' /tmp/check-stale.log && pass "check names the unreachable proxy" || fail "check does not name the unreachable proxy"
+before="$(sha256sum < $DSK/env)"
+$REPO/deploy/linux/setup.sh net-refresh > /tmp/netrefresh0.log 2>&1 && fail "net-refresh ran without proxy settings" || pass "net-refresh refuses a shell without proxy settings: $(tail -n 1 /tmp/netrefresh0.log | cut -c1-80)"
+[ "$(sha256sum < $DSK/env)" = "$before" ] && pass "env file untouched by the refused net-refresh" || fail "refused net-refresh changed the env file"
+muse $REPO/deploy/linux/setup.sh net-refresh > /tmp/netrefresh.log 2>&1 && pass "net-refresh" || fail "net-refresh"
+cat /tmp/netrefresh.log
+[ "$(envsum)" = "$others_before" ] && pass "net-refresh kept every other env line" || fail "net-refresh changed other env lines"
+[ "$(stat -c %a $DSK/env)" = 600 ] && pass "env file still 600" || fail "env file mode after net-refresh"
+$REPO/deploy/linux/setup.sh check --no-model > /tmp/check-refreshed.log 2>&1 && pass "check passes after net-refresh" || { fail "check after net-refresh"; cat /tmp/check-refreshed.log; }
+leak_check /tmp/check-stale.log /tmp/netrefresh0.log /tmp/netrefresh.log /tmp/check-refreshed.log
+
 section "start needs --cutover"
 $REPO/deploy/linux/setup.sh start > /tmp/start0.log 2>&1 && fail "start without --cutover" || pass "start refuses without --cutover: $(head -c 90 /tmp/start0.log)"
 
@@ -197,6 +214,13 @@ section "restart: reconnects"
 $REPO/deploy/linux/setup.sh restart && sleep 20
 systemctl is-active --quiet dsh-slack.service && pass "running after restart" || fail "not running after restart"
 [ "$(grep -c '"ws":"connected"' $LOG)" -ge 2 ] && pass "reconnected after restart" || fail "no reconnect after restart"
+
+section "net-refresh while running: restarts"
+muse $REPO/deploy/linux/setup.sh net-refresh > /tmp/netrefresh2.log 2>&1 && pass "net-refresh while running" || fail "net-refresh while running"
+cat /tmp/netrefresh2.log
+grep -q "restarted dsh-slack" /tmp/netrefresh2.log && pass "net-refresh restarted the bot" || fail "net-refresh did not restart the bot"
+sleep 20
+[ "$(grep -c '"ws":"connected"' $LOG)" -ge 3 ] && pass "reconnected after net-refresh" || fail "no reconnect after net-refresh"
 
 section "stop"
 $REPO/deploy/linux/setup.sh stop
