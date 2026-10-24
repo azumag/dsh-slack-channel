@@ -5,7 +5,8 @@ Muse にはプロンプトでしか頼めないので、VM 側の作業はすべ
 Mac 側（owner）の作業は、秘密の暗号化と、切り替え時の Mac 側 Slack チャンネルの停止だけ。
 
 **2026-10-24 時点の方針（owner 決定）: キットを作って VM で `check` まで通し、切り替え（cutover）は後で判断する。**
-Mac の DSH はそのまま動かしておく。
+Mac の DSH はそのまま動かしておく。**2026-10-25: VM の `check` は通った**（下の「VM の確認結果」）。残りは依頼文 2b（git の名義と
+自動復旧の cron）と、切り替えの判断。
 
 ## VM で動くもの
 
@@ -28,6 +29,16 @@ Mac の DSH はそのまま動かしておく。
   （`no sandbox backend is usable`。サンドボックスなしで動かす設定にはしない）。`check` の `command sandbox` 行で分かる。
 - サービスは systemd の `dsh-slack.service` 1 つ。`start --cutover` まで作られるだけで起動しない。Slack チャンネルの設定
   （`~/.dsh-slack/slack-channel.patch.yml`）はサービスだけが読むので、`check` が Slack のソケットにつなぐことはない。
+- **VM が作り直されると `/home/hatch` 以外は消える**（2026-10-25 に判明。`/etc/systemd/system` のサービスも消え、ボットは
+  自分では戻らない）。生き残るのは Muse 自身の cron だけなので、Muse の cron から 10 分ごとに `setup.sh start-saved` を回す
+  （依頼文 2b）。Claude ボットのキットと同じ形:
+  - `start --cutover` の前、または `stop` の後（`~/.dsh-slack/wanted` が無い）→ 何もしない
+  - 動いていて Slack につながっている → 何もしない
+  - 動いていない → `install` をやり直して（設定・秘密・セッション・入れた DSH はそのまま。プロキシ変数は cron のシェルから）起動
+  - 動いているが、env ファイルのプロキシがトンネルを断り、cron のシェルのプロキシは通る → `net-refresh`（プロキシ行を書き直して再起動）
+  - 動いているが、直近 3 回の Slack ソケット接続がすべて失敗 → `net-refresh`
+  - `start` / `stop` とロック（`~/.dsh-slack/.lock`）を共有するので、人の `stop` とぶつからない。動いたときの記録は
+    `~/.dsh-slack/logs/start-saved.history`（`status` が最後の 5 件を出す）。再起動は動いているターンを中断する（キューには戻る）。
 
 ## Mac から移らないもの（切り替えを判断するときに見る）
 
@@ -47,10 +58,11 @@ Mac の DSH はそのまま動かしておく。
 |---|---|---|
 | 1 | Muse に依頼 | clone → `install` → `keygen`。公開鍵 `dsk-pub1:…` と環境情報を返してもらう |
 | 2 | Mac | 公開鍵に向けて秘密を暗号化（`dsk-sealed1:…` の 1 行ができる） |
-| 3 | Muse に依頼 | `import` → `check`。結果を返してもらう |
-| 4 | owner | 切り替えるか判断（上の表）。**ここまでが 2026-10-24 の範囲** |
+| 3 | Muse に依頼 | `import` → `check`。結果を返してもらう（**2026-10-25 通過**） |
+| 3b | Muse に依頼（依頼文 2b） | `git-identity`、`start-saved` を手で 1 回、10 分ごとの cron 登録 |
+| 4 | owner | 切り替えるか判断（上の表） |
 | 5 | Mac | Mac の DSH の Slack チャンネルを止める（同じ Slack アプリで 2 つ動くと、イベントが振り分けられて両方おかしくなる） |
-| 6 | Muse に依頼 | `start --cutover` |
+| 6 | Muse に依頼（依頼文 3） | `install`（消えたサービスとプロキシ設定を作り直す）→ `start --cutover` |
 | 7 | Slack | DSH にメンションして返事が来るか見る |
 
 ## 依頼文 1（セットアップ）
@@ -127,6 +139,41 @@ check の出力をそのまま返信してください（秘密の値は出ま�
   プロキシで失敗したら `setup.sh netcheck` の出力を返してもらう。シェルとサービスでプロキシ設定が違う（`DIFFERENT`）なら、
   プロキシが効いているシェルで `setup.sh net-refresh`（env ファイルのプロキシ行だけ書き直し、起動済みなら再起動。値は出ない）。
 
+### VM の確認結果（2026-10-25、Muse の報告）
+
+最初の `check` は 4 項目が「the proxy refused the tunnel」で失敗した（env ファイルに写したプロキシ設定が、install から check
+までの間に古くなった）。同じシェルで `net-refresh` → `check` で **all checks passed**:
+
+- `✓ command sandbox — Landlock, fully enforced`（カーネル 7.0.0-39-generic。bubblewrap は不要）
+- `✓ Slack bot token — bot dsh (U0C9C7BNVB5) in azumaya` / app token / socket host（HTTP 200）
+- `✓ web search — DeepSeek Search API answered`
+- `✓ model nvidia/z-ai/glm-5.3-flash — answered OK in 169 s`
+- `· GitHub CLI — logged in as azumag` / `· git user.name — not set`（依頼文 2b で設定する）
+
+プロキシ設定が古くなる件は、`start-saved` が env ファイルのプロキシを試して、断られていれば cron のシェルの設定で
+`net-refresh` する（上の「VM で動くもの」）。どのくらいの間隔で古くなるかは未確認。
+
+## 依頼文 2b（名義と自動復旧の cron。ボットはまだ起動しない）
+
+```text
+<@U0CCCH69XMW> DSH ボットの続きです。check の結果ありがとうございました。今回もボットは起動しません（start は実行しないでください）。VM が作り直されて /etc のサービスが消えても、DSH ボットが自分で戻れるようにする準備です。
+
+1. 更新（いつものプロキシの入ったシェルで）
+   cd ~/dsh-slack-channel && git pull --ff-only
+2. ボットのコミットの名義（~/.gitconfig は変えません）
+   ~/dsh-slack-channel/deploy/linux/setup.sh git-identity "azumag" azumag@users.noreply.github.com
+3. 手で 1 回試す。まだ起動の合図前なので「start-saved: not wanted … nothing to do」で終わるはずです（終了コード 0）
+   ~/dsh-slack-channel/deploy/linux/setup.sh start-saved; echo "exit=$?"
+4. あなたの cron に 10 分ごとのジョブを登録してください（名前の例: dsh-bot-autorecover。claude-bot-autorecover と同じ形）
+   ~/dsh-slack-channel/deploy/linux/setup.sh start-saved
+   報告は、出力に RECOVERING / RESTARTING / error が出たとき、または終了コードが 0 以外のときだけにしてください。「nothing to do」のときは何も言わなくて大丈夫です。
+
+返信してほしいもの: git pull の最後の 1 行 / git-identity と start-saved の出力 / 登録した cron の名前と間隔。
+```
+
+ボットを起動する前に cron を入れても、`~/.dsh-slack/wanted` が無い間は何もしない。`start --cutover` の後は、VM が作り直されても
+10 分ほどで戻る。`stop`（ロールバック）で `wanted` が消えると、また何もしなくなる。
+
 ### bubblewrap を入れる（`✗ command sandbox` のときだけ。VM のシステムパッケージなので owner の OK を取ってから）
 
 Landlock はカーネル次第（無効なカーネルや、seccomp で止めるコンテナがある）。bubblewrap は Ubuntu の標準パッケージ。
@@ -157,20 +204,28 @@ Mac で有効なスケジュール（`~/.dsh/storages/schedule.json`）は、DSH
 ### 依頼文 3（起動）
 
 ```text
-<@U0CCCH69XMW> Mac 側の DSH の Slack 接続を止めました。VM のボットを起動してください。
+<@U0CCCH69XMW> Mac 側の DSH の Slack 接続を止めました。VM のボットを起動してください（いつものプロキシの入ったシェルで）。
 
+cd ~/dsh-slack-channel && git pull --ff-only
+~/dsh-slack-channel/deploy/linux/setup.sh install
 ~/dsh-slack-channel/deploy/linux/setup.sh start --cutover
 ~/dsh-slack-channel/deploy/linux/setup.sh status
 
-両方の出力を返信してください。
+install の最後の 10 行と、start --cutover・status の出力を返信してください。
 ```
 
+`install` は、VM が作り直されて消えたサービスを書き直し、プロキシ設定をこのシェルから写し直す（設定・秘密・入れた DSH・
+git の名義はそのまま）。Claude ボットの切り替えでは、サービスが消えていて最初の `start --cutover` が失敗した。
+
 `start --cutover` の出力に `own identity resolved (bot_id=…, user_id=U0C9C7BNVB5)` が出れば Slack の Web API まで届いている。
-`socket connect failed` / `apps.connections.open failed` が出たら失敗。そのあと Slack で DSH にメンションして、返事が来るか見る。
+`socket connected (num_connections=N)` は Slack が Socket Mode の接続を受け付けた印で、N はこの Slack アプリへの接続数
+（Mac 側が切れていれば 1）。`socket connect failed` / `apps.connections.open failed` が出たら失敗。そのあと Slack で DSH に
+メンションして、返事が来るか見る。
 
 ### 戻すとき（ロールバック）
 
-1. Muse に `~/dsh-slack-channel/deploy/linux/setup.sh stop`（サービスを止めて、再起動時にも上がらないようにする）
+1. Muse に `~/dsh-slack-channel/deploy/linux/setup.sh stop`（サービスを止めて、`wanted` を消す。cron の `start-saved` も
+   これ以降は何もしない）
 2. Mac の `~/.dsh/cordis.patch.yml` の slack-channel 行の `disabled:` を元の式
    `!!js "ctx.get('profileContext') !== undefined && ctx.get('profileContext').name !== 'desktop'"` に戻す（HMR で再接続）
 
@@ -179,13 +234,15 @@ Mac で有効なスケジュール（`~/.dsh/storages/schedule.json`）は、DSH
 | パス | 中身 |
 |---|---|
 | `~/dsh-slack-channel` | このリポジトリ（Slack チャンネルのコード + キット） |
-| `~/.dsh-slack/env` | サービスの環境（HOME、PATH、DSH_HOME、プロキシ変数、ボットの git 名義）。600 |
+| `~/.dsh-slack/env` | サービスの環境（HOME、PATH、DSH_HOME、プロキシ変数、ボットの git 名義）。600。`install` が書き直す（git の名義は残す）ので、手で足す行は `~/.dsh-slack/env.local` に書く |
+| `~/.dsh-slack/wanted` | `start --cutover` が作り、`stop` が消す。`start-saved` はこれがあるときだけ動く |
+| `~/.dsh-slack/logs/start-saved.history` | `start-saved` が起動・再起動したときの記録（UTC） |
 | `~/.dsh-slack/home/` | DSH のホーム: `cordis.patch.yml`（モデルのプロバイダ、Web 検索、GitHub MCP）、`profiles/slack/`、`.env`（API キー）、`sessions/`、`slack-state.json` |
 | `~/.dsh-slack/slack-channel.patch.yml` | Slack チャンネルの設定（サービスだけが `--patch` で読む。秘密は入っていない） |
 | `~/.dsh-slack/secrets/slack.json` | Slack トークン。600 |
 | `~/.dsh-slack/check-home/` | `check` の headless 実行用の DSH ホーム（設定とキーはリンク） |
 | `~/.dsh-slack/logs/dsh.log` | DSH のログ（`setup.sh logs`。DSH の Web 画面のトークンは伏せて表示） |
-| `/etc/systemd/system/dsh-slack.service` | サービス（root で動く VM の場合。`systemctl --user` の場合は `~/.config/systemd/user/`） |
+| `/etc/systemd/system/dsh-slack.service` | サービス（root で動く VM の場合。`systemctl --user` の場合は `~/.config/systemd/user/`）。VM が作り直されると消える → `start-saved` が書き直す |
 
 更新は `cd ~/dsh-slack-channel && git pull --ff-only` → `setup.sh restart`（動いているターンは中断され、再起動後にキューへ戻る）。
 テンプレートを変えたときは `setup.sh install --reconfigure`（古い設定は `.bak-*` で残る）。
@@ -194,5 +251,6 @@ Mac で有効なスケジュール（`~/.dsh/storages/schedule.json`）は、DSH
 
 `deploy/linux/test/run.sh` が、VM に似せた Ubuntu 24.04（x86_64、systemd、root で `HOME=/home/hatch`、外へは HTTP プロキシ経由だけ、
 直接の :443 は平文の箱に当たる）で、clone → install → keygen → seal/import → check → `start --cutover` → 偽の Slack のメンションに
-bash ツールを使って返答 → restart → stop を通す。bash ツールのサンドボックスは bubblewrap（OrbStack のカーネルには Landlock が
+bash ツールと web_search を使って返答 → restart → `start-saved`（サービスが消えた VM をプロキシ無し・有りのシェルから戻す、
+env ファイルのプロキシが 407 を返す、ソケットが失敗し続ける）→ stop を通す。bash ツールのサンドボックスは bubblewrap（OrbStack のカーネルには Landlock が
 無い）。最初の `check` だけ `bwrap` を隠して、`check` がサンドボックスの無いホストを `✗` にすることも見る。Slack・モデル API・GitHub MCP はすべて偽物（`fake-world.mjs`）。
