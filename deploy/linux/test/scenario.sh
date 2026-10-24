@@ -173,6 +173,21 @@ sed -i -E 's#^(https?_proxy|HTTPS?_PROXY|all_proxy|ALL_PROXY)=.*#\1="http://127.
 $REPO/deploy/linux/setup.sh check --no-model > /tmp/check-stale.log 2>&1 && fail "check passed with a dead proxy" || pass "check fails with a dead proxy in the env file"
 grep -m1 'Slack Web API\|Slack bot token' /tmp/check-stale.log
 grep -q 'proxy in the service environment is unreachable' /tmp/check-stale.log && pass "check names the unreachable proxy" || fail "check does not name the unreachable proxy"
+# A proxy that answers every CONNECT with 407 (stale credentials): Node says only "fetch failed" (code 0).
+python3 -c 'import socketserver
+class H(socketserver.BaseRequestHandler):
+    def handle(self):
+        self.request.recv(4096); self.request.sendall(b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+socketserver.ThreadingTCPServer.allow_reuse_address = True
+socketserver.ThreadingTCPServer(("127.0.0.1", 8890), H).serve_forever()' &
+refuser=$!
+trap 'kill $refuser 2>/dev/null' EXIT
+sed -i -E 's#^(https?_proxy|HTTPS?_PROXY|all_proxy|ALL_PROXY)=.*#\1="http://127.0.0.1:8890"#' $DSK/env
+sleep 1
+$REPO/deploy/linux/setup.sh check --no-model > /tmp/check-refused.log 2>&1 && fail "check passed through a refusing proxy" || pass "check fails through a proxy that answers 407"
+kill $refuser 2>/dev/null; trap - EXIT
+grep -m1 'Slack Web API\|Slack bot token' /tmp/check-refused.log
+grep -q 'the proxy refused the tunnel' /tmp/check-refused.log && pass "check names the refused tunnel" || fail "check does not name the refused tunnel"
 before="$(sha256sum < $DSK/env)"
 $REPO/deploy/linux/setup.sh net-refresh > /tmp/netrefresh0.log 2>&1 && fail "net-refresh ran without proxy settings" || pass "net-refresh refuses a shell without proxy settings: $(tail -n 1 /tmp/netrefresh0.log | cut -c1-80)"
 [ "$(sha256sum < $DSK/env)" = "$before" ] && pass "env file untouched by the refused net-refresh" || fail "refused net-refresh changed the env file"
@@ -181,7 +196,7 @@ cat /tmp/netrefresh.log
 [ "$(envsum)" = "$others_before" ] && pass "net-refresh kept every other env line" || fail "net-refresh changed other env lines"
 [ "$(stat -c %a $DSK/env)" = 600 ] && pass "env file still 600" || fail "env file mode after net-refresh"
 $REPO/deploy/linux/setup.sh check --no-model > /tmp/check-refreshed.log 2>&1 && pass "check passes after net-refresh" || { fail "check after net-refresh"; cat /tmp/check-refreshed.log; }
-leak_check /tmp/check-stale.log /tmp/netrefresh0.log /tmp/netrefresh.log /tmp/check-refreshed.log
+leak_check /tmp/check-stale.log /tmp/check-refused.log /tmp/netrefresh0.log /tmp/netrefresh.log /tmp/check-refreshed.log
 
 section "start needs --cutover"
 $REPO/deploy/linux/setup.sh start > /tmp/start0.log 2>&1 && fail "start without --cutover" || pass "start refuses without --cutover: $(head -c 90 /tmp/start0.log)"
