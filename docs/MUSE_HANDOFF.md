@@ -5,8 +5,8 @@ Muse にはプロンプトでしか頼めないので、VM 側の作業はすべ
 Mac 側（owner）の作業は、秘密の暗号化と、切り替え時の Mac 側 Slack チャンネルの停止だけ。
 
 **2026-10-24 時点の方針（owner 決定）: キットを作って VM で `check` まで通し、切り替え（cutover）は後で判断する。**
-Mac の DSH はそのまま動かしておく。**2026-10-25: VM の `check` は通った**（下の「VM の確認結果」）。残りは依頼文 2b（git の名義と
-自動復旧の cron）と、切り替えの判断。
+Mac の DSH はそのまま動かしておく。**2026-10-25: VM の `check` は通った**（下の「VM の確認結果」）。依頼文 2b（git の名義、
+/etc/environment のプロキシ、自動復旧の cron）も済んだ。残りは切り替えの判断。
 
 ## VM で動くもの
 
@@ -157,6 +157,13 @@ check の出力をそのまま返信してください（秘密の値は出ま�
 プロキシ設定が古くなる件は、`start-saved` が env ファイルのプロキシを試して、断られていれば `/etc/environment` の設定
 （通るとき）か cron のシェルの設定で `net-refresh` する（上の「VM で動くもの」）。cron のシェルの認証情報は数分で断られ、
 `/etc/environment` のものは長く通る（opencode キットでの実測）。DSH のサービスで効くかは VM で未確認。
+
+**依頼文 2b の結果（2026-10-25 ~02:50 JST、Muse の報告）:** 874e052 に更新。git の名義 azumag
+<azumag@users.noreply.github.com>（ボットの env だけ）。`net-refresh` → `network settings taken from /etc/environment`。
+`netcheck` ではシェル・env ファイル・/etc/environment のプロキシ設定がすべて同じ値で、どれも slack.com / api.github.com /
+integrate.api.nvidia.com に CONNECT 200 → HTTP 200。`check` は all checks passed（glm-5.3-flash が 213 s で回答）。`start-saved`
+は not wanted（exit 0）。Muse の cron `dsh-bot-autorecover` を 10 分ごとに登録済み（RECOVERING / RESTARTING / error / 0 以外の
+終了のときだけ報告）。
 
 ## 依頼文 2b（名義と自動復旧の cron。ボットはまだ起動しない）
 

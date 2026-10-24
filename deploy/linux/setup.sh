@@ -7,8 +7,8 @@
 #   deploy/linux/setup.sh keygen             print a one-line public key for the secrets handoff
 #   deploy/linux/setup.sh import <blob>      open the sealed secrets (Slack tokens + model API keys)
 #   deploy/linux/setup.sh check [--no-model|--all-routes]   verify everything without connecting to Slack's socket
-#   deploy/linux/setup.sh netcheck           compare this shell's proxy settings with the service's
-#   deploy/linux/setup.sh net-refresh        copy this shell's proxy settings to the service again (restarts it)
+#   deploy/linux/setup.sh netcheck           compare the shell's, the service's and /etc/environment's proxy settings
+#   deploy/linux/setup.sh net-refresh        copy the proxy settings to the service again (restarts it)
 #   deploy/linux/setup.sh git-identity "<name>" <email>   who the bot's commits are by (not ~/.gitconfig)
 #   deploy/linux/setup.sh start --cutover    start DSH with the Slack channel (only once the old bot is stopped)
 #   deploy/linux/setup.sh start-saved        for cron: bring a started bot back when it is down (machine re-created)
@@ -22,6 +22,8 @@
 # Environment overrides: DSK_HOME, DSK_WORKDIR, DSK_PORT (DSH's local web server, default 4198),
 # NODE_VERSION (v24.22.1), DSH_VERSION (0.2.1-rc.2), DSK_SUPERVISOR (system | user | manual).
 # Extra variables for the bot go in $DSK_HOME/env.local (install rewrites env and appends env.local).
+# Proxy settings for the service (install, net-refresh, start-saved) come from /etc/environment when its
+# proxy gets through, else from the running shell.
 set -euo pipefail
 umask 077
 
@@ -719,5 +721,5 @@ case "${1:-}" in
   status) cmd_status ;;
   logs) shift; cmd_logs "$@" ;;
   uninstall) cmd_uninstall ;;
-  *) sed -n '2,24p' "$SELF" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,26p' "$SELF" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
