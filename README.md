@@ -136,6 +136,16 @@ Prefer not to restart on config changes? Set `pairToken` + `stateFile` once, the
 
 [`deploy/linux/setup.sh`](deploy/linux/setup.sh) sets the bot up on a Linux machine from a clone, without the desktop app: its own Node and the npm `dsh` CLI, a `slack` profile with the desktop profile's bundles (models: NVIDIA only; DeepSeek's key serves web search/fetch), a systemd service (`dsh-slack.service`; a background loop where there is no systemd) and everything else under `~/.dsh-slack` (its own `DSH_HOME`). Secrets travel sealed to a one-time key generated on the target (`keygen` → `deploy/secrets.mjs seal` on the source → `import`); `check` tests the install with only the service's environment — tokens, proxy, one headless model turn per provider — without opening the Slack socket, and whether the bash tool has a command sandbox (DSH on Linux confines commands with bubblewrap, else Landlock, and runs none when neither works — `apt-get install bubblewrap` where the kernel has no Landlock); the service starts only with `start --cutover`, because two connections on one Slack app split the events. DSH's log records go to `~/.dsh-slack/logs/dsh.log` (the CLI keeps them in memory otherwise). [`deploy/linux/test/run.sh`](deploy/linux/test/run.sh) runs the whole flow in an Ubuntu container behind an HTTP proxy against fake Slack and model APIs. The walkthrough used to move the bot to another machine is [`docs/MUSE_HANDOFF.md`](docs/MUSE_HANDOFF.md) (Japanese).
 
+### Handing the bot over to another host (receive off)
+
+Two Socket Mode connections on one Slack app split the events between them, so only one host should receive. To move the bot without cutting the turns that run on the old host, start the new host first, then create the **receive-off file** beside the old host's `stateFile` (`state.json` → `state.receive-off`; any content):
+
+```sh
+touch ~/.dsh/slack-state.receive-off      # the old host: close the socket, keep working
+```
+
+Within `receivePollMs` the old host closes its Slack socket (no plugin reload: nothing running there stops). Turns already running and messages already waiting in its queue still run there and reply through the Web API; new messages reach the new host only. An approval or `ask_user_question` raised on the old host is declined at once (`unavailable` / an error naming the handover), because the clicks and `!answer`s now go to the new host. The old host writes what is left to `state.drain.json` (`running` / `waiting` conversation keys, `drained: true` once nothing is left); stop it then. A reload or restart while the file exists mounts without a socket and still resumes what the pending file carried. Delete the file to receive again (the drain file goes with it). A reply posted in a thread whose turn still runs on the old host reaches the new host, which answers it in a session of its own.
+
 ## Channel commands
 
 Commands are plain messages with a verb prefix. **Prefer `!`**: Slack's own
@@ -235,7 +245,7 @@ as a one-entry chain.
 | `allowedChannelIds` | `[]` | Channel allowlist. Empty + `allowAllChannels: false` denies everything. |
 | `allowAllChannels` | `false` | Explicitly serve every channel the bot is in. |
 | `notifyUnauthorized` | `false` | Reply "not authorized" to rejected channels. |
-| `stateFile` | — | JSON file persisting channel → session ids and /pair enrollments. Beside it, `<name>.pending.json` carries waiting messages and running turns across a plugin reload or host restart: teardown writes it, the next mount queues them again (a caught turn resumes with a channel note) and renames the file to `.pending.json.restored`. |
+| `stateFile` | — | JSON file persisting channel → session ids and /pair enrollments. Beside it, `<name>.pending.json` carries waiting messages and running turns across a plugin reload or host restart: teardown writes it, the next mount queues them again (a caught turn resumes with a channel note) and renames the file to `.pending.json.restored`. While `<name>.receive-off` exists the channel keeps no Slack socket and reports what is left in `<name>.drain.json` (handover, above). |
 | `pairToken` | — | Enables the enrollment flow (requires `stateFile`). |
 | `sessionScope` | `channel` | `channel`: one session per channel (threads share it). `thread`: one session per Slack thread — a top-level message opens a new session, replies in its thread continue it; queues, `!stop`, `!new`, prompts and unseen context stay inside the thread. |
 | `replyMode` | `last` | `last`: final assistant message of a turn; `all`: join every assistant message. |
@@ -257,6 +267,7 @@ as a one-entry chain.
 | `interactiveTimeoutMs` | `1800000` (30 min) | How long a Slack approval/question prompt waits before it is settled without an answer (`0` waits until the turn is stopped, `86400000` is the cap). |
 | `retryDelayMs` | `3000` | Backoff after Web API failures. |
 | `socketRetryDelayMs` | `2000` | Backoff between Socket Mode reconnects. |
+| `receivePollMs` | `5000` | How often the receive-off file is checked (handover). |
 
 ### Mentions in replies
 
@@ -382,6 +393,7 @@ src/index.js            entry: name / inject / Config / apply — socket loop wi
 src/schema.js           Standard Schema v1 config validator (inline, no deps)
 src/slack.js            Web API client: call / openConnections / postMessage / updateMessage / reactions, splitMessage
 src/socket.js           Socket Mode loop: fresh-URL reconnect, envelope acks, event + interactive routing
+src/handover.js         receive-off and drain files (moving the bot to another host without stopping its turns)
 src/interactions.js     Slack-side answering for approval/request and user-questions/request (buttons, deadline)
 src/format.js           markdown → Slack mrkdwn (escaped angle brackets, allowlisted mentions restored, fences preserved)
 src/message.js          frozen user-message factory (dsh-llm createUserMessage shape)

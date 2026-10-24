@@ -211,6 +211,36 @@ apt の最後の 5 行と、check の出力をそのまま返信してくださ�
 
 ## 切り替え（owner の OK が出てから）
 
+### 受付だけ先に VM へ移す（owner の希望、2026-10-25）
+
+Mac の DSH は止めずに、**新しい Slack の受付だけ** VM に移す。Mac で動いているターンと、Mac の待ち行列にある依頼は
+Mac で最後まで処理して返信する（返信は Web API なので、ソケットが無くても出せる）。片付いたら Mac の Slack チャンネルを止める。
+仕組みは Slack チャンネルの「受付停止ファイル」（`~/.dsh/slack-state.receive-off`。README の「Handing the bot over」）:
+このファイルがある間、チャンネルは Slack のソケットを閉じたまま動き続け、残りを `~/.dsh/slack-state.drain.json` に書く。
+ファイルを置くだけでプラグインの再読み込みは起きない（dsh-hmr が見ているのは `src/` だけ。チャンネル自身が書く
+`slack-state.json` も再読み込みを起こしていない）。
+
+1. **Mac: 受付停止に対応したコードを入れる（1 回だけ再読み込みが起きる）。** `src/` が変わるので dsh-hmr がチャンネルを
+   読み直し、そのとき動いているターンは中断される。中断されたターンと待ち行列は pending ファイルに保存され、読み直し後に
+   同じセッションで再開する（2026-10-24 に実機で確認済みの仕組み）。owner の OK を取ってから。
+2. **Muse: 依頼文 3（下）で VM のボットを起動する。** Mac もまだつながっているので、出力は `socket connected (num_connections=2)`
+   になるはず。この間（次の 3. まで）は、新しいイベントが Mac と VM に振り分けられる（どちらかが必ず受けるので、取りこぼしはない）。
+3. **Mac: すぐに受付を止める。** `touch ~/.dsh/slack-state.receive-off`。5 秒以内に Mac のソケットが閉じ、
+   `~/.dsh/slack-state.drain.json` ができる。DSH のホストプロセスに `wss-primary.slack.com` への接続が無いことでも確かめる。
+4. **Mac の残りが片付くのを待つ。** `cat ~/.dsh/slack-state.drain.json` の `running`（実行中）と `waiting`（待ち行列）が空になり、
+   `"drained": true` になったら終わり。この間に Mac のターンが承認や質問を出すと、ボタンを押しても VM に届くので、
+   Mac 側ですぐに断る（エージェントには「引き継ぎ中で答えられない」と返る）。
+5. **Mac: Slack チャンネルを止める**（下の「Mac: Slack チャンネルを止める」。もう何も動いていないので中断は起きない）。
+   止めたあとで `rm ~/.dsh/slack-state.receive-off ~/.dsh/slack-state.drain.json`（残しておくと、ロールバックで Mac の
+   チャンネルを戻したときに受付停止のまま上がる）。
+
+注意:
+- Mac でターンが動いているスレッドに新しく返信が来ると、それは VM が受ける。VM はそのスレッドの直近の発言を文脈に新しい
+  セッションで答えるので、Mac と VM の両方が同じスレッドに返信することがある。
+- Mac のスケジュール（`~/.dsh/storages/schedule.json`）は、Mac のチャンネルを止めるまでは Mac で動き、返信も Mac から出る。
+- 3. の途中で戻すとき: VM で `setup.sh stop`、Mac で `rm ~/.dsh/slack-state.receive-off`（5 秒以内に Mac がまた受け付ける。
+  再読み込みは起きない）。
+
 ### Mac: Slack チャンネルを止める
 
 Mac の DSH はデスクトップアプリのまま残し、Slack チャンネルだけ止める。`~/.dsh/cordis.patch.yml` の slack-channel 行の

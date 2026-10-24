@@ -32,6 +32,7 @@ const DEFAULTS = Object.freeze({
   allowAllChannels: false,
   retryDelayMs: 3000,
   socketRetryDelayMs: 2000,
+  receivePollMs: 5000,
   maxReplyChars: 4000,
   replyMode: 'last',
   sessionScope: 'channel',
@@ -248,6 +249,11 @@ function validate(input) {
   if (cfg.socketRetryDelayMs === undefined) {
     issues.push({ message: 'socketRetryDelayMs must be a non-negative number' })
     cfg.socketRetryDelayMs = DEFAULTS.socketRetryDelayMs
+  }
+  cfg.receivePollMs = nonNegativeNumber(src.receivePollMs, DEFAULTS.receivePollMs)
+  if (cfg.receivePollMs === undefined || cfg.receivePollMs < 10) {
+    issues.push({ message: 'receivePollMs must be a number of at least 10' })
+    cfg.receivePollMs = DEFAULTS.receivePollMs
   }
 
   // Replies.

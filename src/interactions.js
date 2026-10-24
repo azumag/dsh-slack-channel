@@ -86,7 +86,7 @@ export function humanDuration(ms) {
  * @param options.authorized - (channelId) => boolean, the same channel gate handleEvent uses.
  * @param options.mrkdwnOptions - formatter options (the mention allowlist).
  */
-export function createInteractions({ config, logger, slack, sessions, authorized, mrkdwnOptions }) {
+export function createInteractions({ config, logger, slack, sessions, authorized, mrkdwnOptions, receiving = () => true }) {
   /** id → entry, for button clicks. */
   const pending = new Map()
   /**
@@ -269,6 +269,12 @@ export function createInteractions({ config, logger, slack, sessions, authorized
   async function answerApproval(request, next) {
     const record = ownedRecord(request.agent)
     if (record === undefined) return next()
+    // Handing over (receive off): clicks and !allow now reach the other host,
+    // so a prompt posted here could only expire. Decline it at once.
+    if (receiving() === false) {
+      logger.info('approval declined: this host no longer receives from Slack (handover)')
+      return 'unavailable'
+    }
     // The service races the signal itself; this is the belt-and-braces case of
     // a request that was already withdrawn when it reached us.
     if (request.signal?.aborted === true) return 'cancelled'
@@ -305,6 +311,10 @@ export function createInteractions({ config, logger, slack, sessions, authorized
   async function answerQuestion(request, next) {
     const record = ownedRecord(request.agent)
     if (record === undefined) return next()
+    if (receiving() === false) {
+      logger.info('question declined: this host no longer receives from Slack (handover)')
+      throw new Error('ask_user_question: this Slack channel is handing over to another host and can no longer receive answers here — continue without asking, and say in your final reply what you still need')
+    }
     if (request.signal?.aborted === true) throw new Error('ask_user_question: the question was cancelled')
     const entry = newEntry({
       kind: 'question',

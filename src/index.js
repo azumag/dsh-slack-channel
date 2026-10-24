@@ -18,6 +18,7 @@ import { createTurnCollector } from './collector.js'
 import { toSlackMrkdwn } from './format.js'
 import { createInteractions } from './interactions.js'
 import { createTextUserMessage } from './message.js'
+import { clearDrain, drainFile, receiveIsOff, receiveOffFile, writeDrain } from './handover.js'
 import { pendingFile, savePending, takePending } from './pending.js'
 import { Config } from './schema.js'
 import { createChatSessions } from './sessions.js'
@@ -68,6 +69,10 @@ export function apply(ctx, config) {
   const abort = new AbortController()
   /** Where waiting messages and interrupted turns wait out a reload (beside the state file). */
   const pendingPath = pendingFile(config.stateFile)
+  /** While this file exists the channel receives nothing from Slack (handover, see handover.js). */
+  const receiveOffPath = receiveOffFile(config.stateFile)
+  const drainPath = drainFile(config.stateFile)
+  let receiving = receiveIsOff(receiveOffPath) === false
 
   // Handed to every formatter call: model output is escaped wholesale, so the
   // ids in config.mentionUserIds are the only ones that survive as real Slack
@@ -77,7 +82,7 @@ export function apply(ctx, config) {
   // Interactive prompts (permission approvals and ask_user_question) for the
   // sessions this plugin owns are answered from Slack — see interactions.js.
   // `authorized` is hoisted, so the manager can capture it here.
-  const interactions = createInteractions({ config, logger, slack, sessions, authorized, mrkdwnOptions })
+  const interactions = createInteractions({ config, logger, slack, sessions, authorized, mrkdwnOptions, receiving: () => receiving })
 
   /**
    * Identities of THIS bot (auth.test's bot_id and user_id). Other
@@ -877,31 +882,82 @@ export function apply(ctx, config) {
   // Queuing it again opens the event chain, ahead of every new message, once
   // our identity is known (the plugin is up; sessions are created after it).
   const restored = takePending(pendingPath, logger)
+  /** Saved entries and Slack payloads not yet handled (none left = the drain status is final). */
+  let unhandled = restored.length === 0 ? 0 : 1
   let eventChain = restored.length === 0
     ? Promise.resolve()
-    : identityProbe.then(() => restorePending(restored)).catch((error) => logger.warn('restoring waiting messages failed: ' + errorText(error)))
-  const socketLoop = runSocketLoop({
-    slack,
-    onEvent: (event) => {
-      eventChain = eventChain
-        .then(() => handleEvent(event))
-        .catch((error) => logger.warn('event handling failed: ' + errorText(error)))
-    },
-    // Button clicks ride the same chain as events: a click that answers a
-    // prompt and rewrites its message stays ordered against the posts around
-    // it, and a slow handler can never interleave two Slack writes.
-    onInteractive: (payload) => {
-      eventChain = eventChain
-        .then(() => interactions.handleInteractive(payload))
-        .catch((error) => logger.warn('interaction handling failed: ' + errorText(error)))
-      return eventChain
-    },
-    signal: abort.signal,
-    logger,
-    retryDelayMs: config.socketRetryDelayMs,
-    wsFactory: config.wsFactory,
-  })
-  socketLoop.catch((error) => logger.error('socket loop crashed: ' + errorText(error)))
+    : identityProbe.then(() => restorePending(restored)).catch((error) => logger.warn('restoring waiting messages failed: ' + errorText(error))).finally(() => { unhandled -= 1 })
+  // The socket runs while receiving; the receive-off file closes it (and its
+  // removal opens it again) without a reload, so nothing running here stops.
+  let socketAbort
+  let socketLoop = Promise.resolve()
+  function startSocket() {
+    if (socketAbort !== undefined || closing) return
+    socketAbort = new AbortController()
+    socketLoop = runSocketLoop({
+      slack,
+      onEvent: (event) => {
+        unhandled += 1
+        eventChain = eventChain
+          .then(() => handleEvent(event))
+          .catch((error) => logger.warn('event handling failed: ' + errorText(error)))
+          .finally(() => { unhandled -= 1 })
+      },
+      // Button clicks ride the same chain as events: a click that answers a
+      // prompt and rewrites its message stays ordered against the posts around
+      // it, and a slow handler can never interleave two Slack writes.
+      onInteractive: (payload) => {
+        unhandled += 1
+        eventChain = eventChain
+          .then(() => interactions.handleInteractive(payload))
+          .catch((error) => logger.warn('interaction handling failed: ' + errorText(error)))
+          .finally(() => { unhandled -= 1 })
+        return eventChain
+      },
+      signal: AbortSignal.any([abort.signal, socketAbort.signal]),
+      logger,
+      retryDelayMs: config.socketRetryDelayMs,
+      wsFactory: config.wsFactory,
+    })
+    socketLoop.catch((error) => logger.error('socket loop crashed: ' + errorText(error)))
+  }
+  function stopSocket() {
+    socketAbort?.abort()
+    socketAbort = undefined
+  }
+
+  let drainState = ''
+  /** Follow the receive-off file; while it is there, say what still runs or waits here. */
+  function checkReceive() {
+    if (closing) return
+    const off = receiveIsOff(receiveOffPath)
+    if (off && receiving) {
+      receiving = false
+      stopSocket()
+      logger.info('receive off (' + receiveOffPath + '): Slack socket closed; running turns and waiting messages finish here, new messages go to the other host')
+    } else if (!off && !receiving) {
+      receiving = true
+      drainState = ''
+      clearDrain(drainPath)
+      startSocket()
+      logger.info('receive on again: ' + receiveOffPath + ' is gone, Slack socket opening')
+    }
+    if (receiving) return
+    const running = sessions.all().filter((record) => record.busy === true).map((record) => record.key ?? String(record.chatId))
+    const waiting = sessions.all().filter((record) => record.queue.length > 0).map((record) => record.key ?? String(record.chatId))
+    const drained = running.length === 0 && waiting.length === 0 && unhandled === 0
+    const state = JSON.stringify({ running, waiting, drained })
+    if (state === drainState) return
+    if (drained) logger.info('receive off: nothing runs or waits here any more — this host can be stopped')
+    drainState = state
+    writeDrain(drainPath, { receiving: false, drained, running, waiting, updatedAt: new Date().toISOString() }, logger)
+  }
+
+  if (receiving) startSocket()
+  else logger.info('receive off at mount (' + receiveOffPath + '): no Slack socket; what was saved still runs here')
+  const receiveTimer = receiveOffPath === undefined ? undefined : setInterval(checkReceive, config.receivePollMs)
+  receiveTimer?.unref?.()
+  if (!receiving) checkReceive()
 
   ctx.effect(() => teardown, 'slack-channel')
 
@@ -911,6 +967,7 @@ export function apply(ctx, config) {
     // file as soon as this disposal is done. No turn starts after this point.
     closing = true
     savePending(pendingPath, pendingSnapshot(), logger)
+    clearInterval(receiveTimer)
     abort.abort()
     try {
       await socketLoop
