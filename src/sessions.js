@@ -9,6 +9,7 @@
 import { randomUUID } from 'node:crypto'
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
+import { installSlackSurface } from './surface.js'
 
 /** Load the persisted chat map, tolerating absent or corrupt files. */
 function loadState(stateFile) {
@@ -23,13 +24,149 @@ function loadState(stateFile) {
   return { version: 1, chats: {}, enrolled: [] }
 }
 
+/** Request-failure codes that mean the provider budget, not the request, is exhausted. */
+const QUOTA_FAILURE_CODES = new Set(['QUOTA', 'ACCOUNT_QUOTA'])
+
+/** globalThis key of the live agents this plugin joined, shared across plugin reloads. */
+const JOINED_AGENTS = Symbol.for('dsh-slack-channel.joined-agents')
+
+/**
+ * Whether a resume failed because someone else owns the session: its write
+ * lock (dsh-session-persistence `SessionAlreadyOwnedError`), or the agent
+ * registry already holding that id.
+ */
+function isHeldElsewhere(error) {
+  if (error?.name === 'SessionAlreadyOwnedError') return true
+  const message = String(error?.message ?? error)
+  return message.includes('already owned by an active write handle')
+    || message.includes('is already registered')
+    || message.includes('while it is live')
+}
+
+function sameRoute(a, b) {
+  return a.provider === b.provider && a.model === b.model
+}
+
+/**
+ * The fallback chain for an agent whose own route is `primary`: the configured
+ * routes in order, minus any that repeat the primary or an earlier entry —
+ * retrying the same route once more would only delay the next real fallback.
+ * @param cfg - validated plugin config.
+ * @param primary - route the agent is created or resumed with.
+ * @returns routes to try in order after a failure; empty when the fallback is off.
+ */
+function fallbackChain(cfg, primary) {
+  const chain = []
+  for (const route of cfg.fallbacks ?? []) {
+    if (sameRoute(route, primary) || chain.some((seen) => sameRoute(seen, route))) continue
+    chain.push(route)
+  }
+  return chain
+}
+
+/**
+ * Retry one agent's failed model request on the next route of the chain. The
+ * listeners are agent-scoped: the request override runs again for every
+ * attempt, so returning `retry` from `agent/request-error` makes the loop's
+ * next attempt use the next route in the same turn. They are registered after
+ * the profile's llm-retry listener, which wraps them: a retryable failure
+ * (RATE_LIMIT, SERVER, TIMEOUT …) reaches this chain only once that provider's
+ * own retry policy has given up. A failure on the last route is delegated
+ * instead of retried forever.
+ *
+ * Every turn starts again on the primary route, so a route that recovered is
+ * used again instead of the session staying on a fallback for good. With a
+ * cooldown the primary is also tried again inside the turn once that long has
+ * passed since the last switch: NVIDIA's 429s clear within a minute or two,
+ * but one Slack turn can run for hours, and on 2026-10-23 such turns spent
+ * every remaining step (up to 416) on the opencode-go quota. A primary that
+ * still fails walks the chain again from its first route. The loop
+ * opens one AbortController per turn and hands its signal to every hook of
+ * that turn, which is what marks the turn boundary here. The loop also seeds
+ * each request from the last logged request header — after a switch that is
+ * the fallback route — so the primary has to be put back explicitly.
+ *
+ * @param agentCtx - the agent's scoped context, supplied by `setup`.
+ * @param primary - the agent's own route.
+ * @param chain - routes to try in order (non-empty).
+ * @param fallbackOn - 'any' failure, or 'quota' failures only.
+ * @param logger - named plugin logger, for the switch warnings.
+ * @param cooldownMs - time on a fallback before the primary is tried again in the same turn; 0 keeps it for the turn.
+ * @param now - clock, injectable for tests.
+ */
+function installRouteFallback(agentCtx, primary, chain, fallbackOn, logger, cooldownMs = 0, now = Date.now) {
+  /** Index of the route in use; -1 is the agent's own (primary) route. */
+  let position = -1
+  /** Signal of the turn the last switch happened in. */
+  let switchedIn
+  /** Whether any request of this agent ever left the primary route. */
+  let switched = false
+  /** When the last switch happened, for the cooldown. */
+  let switchedAt = 0
+
+  /**
+   * The route requests of this turn must use, or undefined to leave the
+   * loop's own proposal alone (no switch ever happened).
+   * @param signal - the turn's abort signal; undefined outside a turn.
+   */
+  function routeFor(signal) {
+    if (position >= 0 && signal !== undefined && signal !== switchedIn) position = -1
+    if (position >= 0 && cooldownMs > 0 && now() - switchedAt >= cooldownMs) {
+      logger.info('fallback cooldown over; trying ' + primary.provider + '/' + primary.model + ' again')
+      position = -1
+    }
+    if (position >= 0) return chain[position]
+    return switched ? primary : undefined
+  }
+
+  agentCtx.on('system-prompt/assemble', async (_assembly, context, next) => {
+    const selected = routeFor(context?.signal)
+    const assembled = await next()
+    if (selected === undefined) return assembled
+    return {
+      ...assembled,
+      variables: { ...assembled.variables, provider: selected.provider, model: selected.model },
+    }
+  })
+
+  agentCtx.on('agent/request', async (payload, next) => {
+    const resolved = await next()
+    const selected = routeFor(payload?.signal)
+    if (selected === undefined || sameRoute(selected, resolved)) return resolved
+    const { reasoningEffort: _inheritedEffort, ...rest } = resolved
+    return {
+      ...rest,
+      provider: selected.provider,
+      model: selected.model,
+      ...(selected.reasoningEffort === undefined ? {} : { reasoningEffort: selected.reasoningEffort }),
+    }
+  })
+
+  agentCtx.on('agent/request-error', async (payload, next) => {
+    const from = routeFor(payload?.signal) ?? primary
+    if (position + 1 >= chain.length || payload?.signal?.aborted === true) return next()
+    const code = payload?.failure?.code
+    if (fallbackOn === 'quota' && !QUOTA_FAILURE_CODES.has(code)) return next()
+    position += 1
+    switchedIn = payload?.signal
+    switched = true
+    switchedAt = now()
+    const to = chain[position]
+    logger.warn('model request failed on ' + from.provider + '/' + from.model + ' (' + code + '); retrying this turn on '
+      + to.provider + '/' + to.model + ' (fallback ' + (position + 1) + '/' + chain.length + ')')
+    return { kind: 'retry' }
+  })
+}
+
 /**
  * Build the chat-session manager.
  * @param options.ctx - the cordis context carrying the agents registry.
  * @param options.config - validated plugin config (provider/model/cwd/stateFile).
  * @param options.logger - named plugin logger.
+ * @param options.selfUserId - getter for this bot's Slack user id (undefined until auth.test answers).
+ * @param options.now - clock for the fallback cooldown, injectable for tests.
  */
-export function createChatSessions({ ctx, config, logger }) {
+export function createChatSessions({ ctx, config, logger, selfUserId, now = Date.now }) {
   const byChat = new Map()
   const bySession = new Map()
   let state = loadState(config.stateFile)
@@ -91,37 +228,103 @@ export function createChatSessions({ ctx, config, logger }) {
    * service: an unset preset, an unmounted registry, or a resolve failure
    * keeps the composition defaults and only warns, so the channel still
    * answers.
+   *
+   * The same setup installs the fallback chain when configured, so fresh and
+   * resumed sessions switch routes on a failed request without rebuilding the
+   * preset. Fallbacks identical to the agent's own route are dropped: they
+   * would retry the same route once more for no benefit. With `slackSurface`
+   * it also tells the agent it is on Slack and guards the Slack API (see
+   * surface.js) — on resume too, so an existing thread session is covered.
+   *
+   * @param options - route the agent is created or resumed with.
+   * @returns preset selection and setup, or an empty object when neither applies.
    */
-  async function composeAgent() {
-    if (config.agentPreset === undefined) return {}
-    const presets = ctx.get('agentPresets')
-    if (presets === undefined) {
-      logger.warn('agentPreset configured but no agentPresets service is mounted; keeping composition defaults')
-      return {}
-    }
+  async function composeAgent(options) {
+    const chain = fallbackChain(config, options)
+    let presets
     let resolvedId
-    try {
-      resolvedId = (await presets.resolve(config.agentPreset)).id
-    } catch (error) {
-      logger.warn('agentPreset ' + JSON.stringify(config.agentPreset) + ' did not resolve: ' + (error?.message ?? String(error)))
-      return {}
+    if (config.agentPreset !== undefined) {
+      presets = ctx.get('agentPresets')
+      if (presets === undefined) {
+        logger.warn('agentPreset configured but no agentPresets service is mounted; keeping composition defaults')
+      } else {
+        try {
+          resolvedId = (await presets.resolve(config.agentPreset)).id
+        } catch (error) {
+          logger.warn('agentPreset ' + JSON.stringify(config.agentPreset) + ' did not resolve: ' + (error?.message ?? String(error)))
+        }
+      }
+    }
+    const surface = config.slackSurface === true
+    if (resolvedId === undefined && chain.length === 0 && !surface) return {}
+    // The channel's own listeners, without the preset: a live agent this
+    // plugin joins (see adopt) was already composed by its owner, so
+    // mounting the preset again would register its tools twice.
+    const channelSetup = (agentCtx) => {
+      if (chain.length > 0) installRouteFallback(agentCtx, options, chain, config.fallbackOn ?? 'any', logger, config.fallbackCooldownMs ?? 0, now)
+      if (surface) installSlackSurface(agentCtx, { config, selfUserId, logger })
     }
     return {
-      agentPreset: resolvedId,
-      setup: async (agentCtx) => { await presets.mount(agentCtx, resolvedId) },
+      ...(resolvedId === undefined ? {} : { agentPreset: resolvedId }),
+      setup: async (agentCtx) => {
+        if (resolvedId !== undefined && presets !== undefined) await presets.mount(agentCtx, resolvedId)
+        channelSetup(agentCtx)
+      },
+      ...(chain.length === 0 && !surface ? {} : { channelSetup }),
     }
+  }
+
+  /**
+   * Join a mapped session that is already live in this process instead of
+   * resuming a second copy of it. The host keeps a session live after it
+   * resumed it to deliver a schedule reminder (and the Web UI holds the one it
+   * shows); resuming then fails on the session's write lock, and starting a
+   * fresh session instead silently cut the thread off from its history (8
+   * threads, 2026-10-19..22, each right after a `[SCHEDULE REMINDER BATCH]`
+   * turn). The owner keeps the agent: dispose only drops this plugin's record.
+   * The channel listeners go onto the agent once per agent, across plugin
+   * reloads too (a registry on globalThis, keyed by the agent object), since
+   * a second fallback chain or surface section would act twice; after a
+   * reload the joined agent keeps the listeners its first join installed.
+   * @param agent - the live agent from the registry.
+   * @param composition - the result of composeAgent for this route.
+   * @returns a handle shaped like ctx.agents.resume's.
+   */
+  function adopt(agent, composition) {
+    const joined = (globalThis[JOINED_AGENTS] ??= new WeakSet())
+    if (composition.channelSetup !== undefined && !joined.has(agent)) {
+      if (agent.ctx === undefined) {
+        logger.warn('joined live session ' + agent.id + ' exposes no agent context; it runs without the channel fallback chain and Slack surface')
+      } else {
+        try {
+          composition.channelSetup(agent.ctx)
+          joined.add(agent)
+        } catch (error) {
+          logger.warn('channel setup on live session ' + agent.id + ' failed: ' + (error?.message ?? String(error)))
+        }
+      }
+    }
+    logger.info('session ' + agent.id + ' is already live (its owner holds it); joining it instead of resuming a copy')
+    return { agent, dispose: async () => {} }
   }
 
   async function create(key, chatId, resumeSessionId) {
     // Channel-scoped workspace first (the Slack-section ↔ DSH-workspace
     // mapping), then the plugin-wide workspace, then the server's cwd.
     const cwd = config.channelCwd?.[String(chatId)] ?? config.cwd ?? process.cwd()
+    // One route for the create and the resume path, so the setup can tell
+    // which configured fallbacks would just retry that same route.
+    const options = agentOptions()
     // Composed once per create/resume so the resume and the fresh path mount
-    // the same preset revision.
-    const composition = await composeAgent()
+    // the same preset revision and install the same fallback listeners.
+    const composition = await composeAgent(options)
     let handle
     let resumed = false
-    if (resumeSessionId !== undefined) {
+    const live = resumeSessionId === undefined ? undefined : ctx.agents.get?.(resumeSessionId)
+    if (live !== undefined) {
+      handle = adopt(live, composition)
+      resumed = true
+    } else if (resumeSessionId !== undefined) {
       try {
         // Resumed agents seed their first request route from their options
         // (a fresh loop instance has no logged header of its own), so the
@@ -132,19 +335,26 @@ export function createChatSessions({ ctx, config, logger }) {
         // Web controller re-mounts on resume.
         handle = await ctx.agents.resume({
           resumeSessionId,
-          agentOptions: agentOptions(),
+          agentOptions: options,
           ...(composition.setup === undefined ? {} : { setup: composition.setup }),
         })
         resumed = true
       } catch (error) {
-        if (String(error?.message ?? error).includes('while it is live')) {
-          // The mapped session is open in another surface (e.g. the web UI
-          // holds it). Falling back to a fresh session here would silently
-          // abandon the mapped conversation and overwrite this mapping via
-          // saveState — surface the conflict and keep the mapping instead.
+        // The session went live while this resume ran (the host resumed it
+        // for a reminder at the same moment): join that agent.
+        const raced = ctx.agents.get?.(resumeSessionId)
+        if (raced !== undefined) {
+          handle = adopt(raced, composition)
+          resumed = true
+        } else if (isHeldElsewhere(error)) {
+          // The write lock is held outside this process (another DSH process
+          // has the session open). Falling back to a fresh session here would
+          // silently abandon the mapped conversation and overwrite this
+          // mapping via saveState — surface the conflict and keep the mapping.
           throw error
+        } else {
+          logger.warn('resume of session ' + resumeSessionId + ' failed (' + (error?.message ?? String(error)) + '); starting a fresh session')
         }
-        logger.warn('resume of session ' + resumeSessionId + ' failed (' + (error?.message ?? String(error)) + '); starting a fresh session')
       }
     }
     if (handle === undefined) {
@@ -156,7 +366,7 @@ export function createChatSessions({ ctx, config, logger }) {
           // transcript readers) sees which preset composed this session.
           ...(composition.agentPreset === undefined ? {} : { agentPreset: composition.agentPreset }),
         },
-        agentOptions: agentOptions(),
+        agentOptions: options,
         ...(composition.setup === undefined ? {} : { setup: composition.setup }),
       })
       applyPermissionPreset(handle)
@@ -169,6 +379,11 @@ export function createChatSessions({ ctx, config, logger }) {
       agent: handle.agent,
       dispose: handle.dispose,
       resumed,
+      /**
+       * True until the first turn is submitted to a CREATED (not resumed)
+       * session: it has no conversation history yet. The channel clears it.
+       */
+      fresh: resumed === false,
       /** Messages waiting while the agent works; drained FIFO on settle. */
       queue: [],
       busy: false,
@@ -274,5 +489,5 @@ export function createChatSessions({ ctx, config, logger }) {
     }
   }
 
-  return { get, lookup, record, stopTyping, disposeAll, enroll, isEnrolled, size: () => byChat.size }
+  return { get, lookup, record, all: () => [...byChat.values()], stopTyping, disposeAll, enroll, isEnrolled, size: () => byChat.size }
 }

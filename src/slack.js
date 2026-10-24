@@ -155,6 +155,38 @@ export class SlackClient {
       return false
     }
   }
+
+  /**
+   * Messages of one thread, oldest first, the parent included
+   * (conversations.replies; channels/groups/im:history scopes). Slack pages
+   * oldest first, so the cursor is followed — up to maxPages — to reach a
+   * long thread's newest messages; every page repeats the parent, so
+   * messages are de-duplicated by ts.
+   * @param channelId - the channel holding the thread.
+   * @param threadTs - the thread's parent ts.
+   * @param options - latest (only messages before this ts), limit (per
+   *   page), maxPages, and abort signal.
+   * @throws SlackApiError on any failed page (missing scope, network, …).
+   */
+  async replies(channelId, threadTs, { latest, limit = 200, maxPages = 10, signal } = {}) {
+    const messages = []
+    const seen = new Set()
+    let cursor
+    for (let page = 0; page < maxPages; page++) {
+      const payload = { channel: channelId, ts: threadTs, limit }
+      if (latest !== undefined) payload.latest = latest
+      if (cursor !== undefined) payload.cursor = cursor
+      const result = await retryOnRateLimit(() => this.call('conversations.replies', this.#botToken, payload, { signal }), { signal })
+      for (const message of result.messages ?? []) {
+        if (seen.has(message.ts)) continue
+        seen.add(message.ts)
+        messages.push(message)
+      }
+      cursor = result.response_metadata?.next_cursor
+      if (result.has_more !== true || typeof cursor !== 'string' || cursor.length === 0) break
+    }
+    return messages
+  }
 }
 
 /**

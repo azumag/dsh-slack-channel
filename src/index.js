@@ -18,6 +18,7 @@ import { createTurnCollector } from './collector.js'
 import { toSlackMrkdwn } from './format.js'
 import { createInteractions } from './interactions.js'
 import { createTextUserMessage } from './message.js'
+import { pendingFile, savePending, takePending } from './pending.js'
 import { Config } from './schema.js'
 import { createChatSessions } from './sessions.js'
 import { SlackClient, sleep, splitMessage } from './slack.js'
@@ -60,14 +61,18 @@ export function apply(ctx, config) {
 
   const logger = ctx.logger('slack-channel')
   const slack = new SlackClient({ apiBase: config.apiBase, botToken, appToken })
-  const sessions = createChatSessions({ ctx, config, logger })
+  // selfUserId is declared below and set once auth.test answers; the getter
+  // is read at prompt assembly, long after apply() ran.
+  const sessions = createChatSessions({ ctx, config, logger, selfUserId: () => selfUserId })
   const warnedChannels = new Set()
   const abort = new AbortController()
+  /** Where waiting messages and interrupted turns wait out a reload (beside the state file). */
+  const pendingPath = pendingFile(config.stateFile)
 
   // Handed to every formatter call: model output is escaped wholesale, so the
   // ids in config.mentionUserIds are the only ones that survive as real Slack
   // mentions (see format.js). An empty allowlist keeps them all as text.
-  const mrkdwnOptions = { mentionUserIds: config.mentionUserIds }
+  const mrkdwnOptions = { mentionUserIds: config.mentionUserIds, mentionRewrites: config.mentionRewrites }
 
   // Interactive prompts (permission approvals and ask_user_question) for the
   // sessions this plugin owns are answered from Slack — see interactions.js.
@@ -131,18 +136,19 @@ export function apply(ctx, config) {
 
   /**
    * The user to mention back when answering this message, or undefined.
-   * Anyone who mentions us is mentioned back — humans and other apps alike
-   * (an app's message carries its own bot_id AND its user id, which is the
-   * spelling a mention needs). Our own posts never reach here, and the
-   * self-id check keeps that true even if the filter above is relaxed.
-   * Commands are answered by notices, not by the agent, and get no mention.
+   * Humans who mention us are mentioned back. Other apps are only mentioned
+   * back when `mentionBackBots` is on: the automatic ping is what closes a
+   * two-agent loop, so the default is to answer without pinging back. Our own
+   * posts never reach here, and the self-id check keeps that true even if the
+   * filter above is relaxed. Commands are answered by notices, not by the
+   * agent, and get no mention.
    *
-   * NOTE: two agents that mention each other can keep answering each other.
-   * A channel where every participant replies to every message already had
-   * that shape; the mention only makes the ping explicit. Add a rule here
-   * (cooldown, channel allowlist, first-reply-only) if that ever runs hot.
+   * The chain is also capped by `maxBotTurns` (see tripBotTurns): even with
+   * mentionBackBots on, two agents cannot answer each other indefinitely.
    */
   function mentionBackTarget(event, text) {
+    const isBot = typeof event.bot_id === 'string' && event.bot_id.length > 0
+    if (isBot && config.mentionBackBots !== true && !(config.mentionBackBotIds ?? []).includes(event.user)) return undefined
     if (typeof event.user !== 'string' || event.user.length === 0) return undefined
     if (selfIds !== undefined && selfIds.has(event.user)) return undefined
     return isSelfMention(text) ? event.user : undefined
@@ -163,6 +169,85 @@ export function apply(ctx, config) {
    */
   function conversationOf(channel, rootTs) {
     return config.sessionScope === 'thread' ? channel + ':' + rootTs : channel
+  }
+
+  /**
+   * Per-conversation bot guard state: how many app-driven turns have run
+   * since the last human message, and the normalized texts that drove them.
+   *
+   * A turn count alone would cut a legitimate collaboration short after a
+   * couple of progress reports, so repetition is the primary brake: identical
+   * content is not progress. The turn count is a generous backstop. A human
+   * message resets both.
+   */
+  const botGuards = new Map()
+
+  /** Bound the bookkeeping on a host that sees many conversations. */
+  const BOT_GUARDS_MAX = 1000
+
+  /** How many recent normalized texts are compared for repetition. */
+  const BOT_REPEAT_WINDOW = 8
+
+  function resetBotGuard(conversation) {
+    botGuards.delete(conversation)
+  }
+
+  /** Compare content, not the mention prefix or incidental whitespace. */
+  function normalizeBotText(text) {
+    return String(text ?? '')
+      .replace(/<@!?[A-Za-z0-9_-]+>/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase()
+  }
+
+  /**
+   * Record one app message that is about to drive a turn.
+   *
+   * @returns {boolean} true when the bot must stay silent instead.
+   */
+  function tripBotGuard(conversation, text) {
+    // HMR can reload this module before the plugin config is revalidated;
+    // fall back to the documented defaults so a reload cannot silently
+    // disable the guard in that window.
+    const maxTurns = config.maxBotTurns ?? 10
+    const maxRepeats = config.maxBotRepeats ?? 3
+    if (maxTurns === 0 && maxRepeats === 0) return false
+    const state = botGuards.get(conversation) ?? { turns: 0, recent: [] }
+    const normalized = normalizeBotText(text)
+
+    // Count repetitions before recording this occurrence: `repeat` is how
+    // many times this exact text already drove a turn.
+    const repeat = normalized === '' ? 0 : state.recent.filter((entry) => entry === normalized).length
+    if (normalized !== '') {
+      state.recent.push(normalized)
+      if (state.recent.length > BOT_REPEAT_WINDOW) {
+        state.recent.splice(0, state.recent.length - BOT_REPEAT_WINDOW)
+      }
+    }
+
+    let reason
+    if (maxRepeats > 0 && repeat >= maxRepeats) {
+      reason = 'repeat'
+    } else {
+      state.turns += 1
+      if (maxTurns > 0 && state.turns > maxTurns) reason = 'turns'
+    }
+
+    // Re-insert so the map's oldest key is the first eviction candidate.
+    botGuards.delete(conversation)
+    botGuards.set(conversation, state)
+    while (botGuards.size > BOT_GUARDS_MAX) {
+      const oldest = botGuards.keys().next().value
+      if (oldest === undefined) break
+      botGuards.delete(oldest)
+    }
+
+    if (reason === undefined) return false
+    logger.warn(
+      'bot loop guard: staying silent (' + reason + '; turns ' + state.turns + ', repeat ' + repeat + ') in ' + conversation,
+    )
+    return true
   }
 
   /**
@@ -192,7 +277,7 @@ export function apply(ctx, config) {
     if (config.contextMessages === 0) return
     const buffer = unseenByChannel.get(channel) ?? []
     const body = text.length > UNSEEN_TEXT_MAX ? text.slice(0, UNSEEN_TEXT_MAX) + '…' : text
-    buffer.push({ who: speakerLabel(event), text: body })
+    buffer.push({ ts: event.ts, who: speakerLabel(event), text: body })
     if (buffer.length > config.contextMessages) buffer.splice(0, buffer.length - config.contextMessages)
     // Re-insert so the map's order is least-recently-used last.
     unseenByChannel.delete(channel)
@@ -205,14 +290,18 @@ export function apply(ctx, config) {
   }
 
   /**
-   * The context block for a turn that addresses the bot — the buffered
-   * messages, consumed here so each one is carried exactly once. Undefined
-   * when there is nothing to add.
+   * The buffered messages for a turn that addresses the bot, consumed here so
+   * each one is carried exactly once. Empty when there is nothing to add.
    */
-  function takeUnseenContext(channel) {
+  function takeUnseen(channel) {
     const buffer = unseenByChannel.get(channel)
     unseenByChannel.delete(channel)
-    if (buffer === undefined || buffer.length === 0) return undefined
+    return buffer ?? []
+  }
+
+  /** The context block for taken unseen messages; undefined when there are none. */
+  function unseenBlock(buffer) {
+    if (buffer.length === 0) return undefined
     return [
       '[channel context — ' + buffer.length + ' message(s) posted since your last reply, oldest first]',
       ...buffer.map((message) => message.who + ': ' + message.text),
@@ -221,19 +310,94 @@ export function apply(ctx, config) {
   }
 
   /**
+   * Slack subtypes that are real posts and belong in a thread backfill; every
+   * other subtype (joins, edits, deletes, …) is a trace.
+   */
+  const THREAD_CONTEXT_SUBTYPES = new Set([undefined, 'bot_message', 'thread_broadcast', 'file_share'])
+
+  /** Time budget for one thread backfill, all pages included (event chain bound). */
+  const THREAD_CONTEXT_TIMEOUT_MS = 10000
+
+  /** Whether a fetched message is one of OUR earlier posts. */
+  function isOwnPost(message) {
+    if (selfIds === undefined) return false
+    return (typeof message.bot_id === 'string' && selfIds.has(message.bot_id))
+      || (typeof message.user === 'string' && selfIds.has(message.user))
+  }
+
+  /**
+   * The thread-history block for the first turn of a session created for a
+   * thread that already has messages (the thread began before sessionScope
+   * 'thread', or after !new, or before a restart): the thread's messages
+   * before the triggering one, newest `threadContextMessages` kept, minus
+   * those the unseen block already carries. One line per message; the root
+   * is marked [thread parent] and our own posts [assistant]. A failed fetch
+   * (missing scope, network) is logged and the turn goes on without it.
+   * @param skipTs - ts of the messages carried by the unseen block.
+   */
+  async function threadContext(channel, rootTs, triggerTs, skipTs) {
+    if (config.threadContextMessages === 0) return undefined
+    let messages
+    try {
+      const signal = AbortSignal.any([abort.signal, AbortSignal.timeout(THREAD_CONTEXT_TIMEOUT_MS)])
+      messages = await slack.replies(channel, rootTs, { latest: triggerTs, signal })
+    } catch (error) {
+      logger.warn('thread history for ' + channel + ':' + rootTs + ' unavailable, continuing without it: ' + errorText(error))
+      return undefined
+    }
+    const entries = []
+    for (const message of messages) {
+      if (!THREAD_CONTEXT_SUBTYPES.has(message.subtype)) continue
+      if (typeof message.ts !== 'string' || skipTs.has(message.ts)) continue
+      if (Number(message.ts) >= Number(triggerTs)) continue
+      const flat = (message.text ?? '').trim().replace(/\s*\n\s*/g, ' ⏎ ')
+      if (flat.length === 0) continue
+      const body = flat.length > UNSEEN_TEXT_MAX ? flat.slice(0, UNSEEN_TEXT_MAX) + '…' : flat
+      const parent = message.ts === rootTs
+      const line = (parent ? '[thread parent] ' : '') + (isOwnPost(message) ? '[assistant] ' + body : speakerLabel(message) + ': ' + body)
+      entries.push({ parent, line })
+    }
+    if (entries.length === 0) return undefined
+    // Newest messages win the cap, but the parent — what the thread is about
+    // — keeps its place at the top.
+    const kept = entries.slice(-config.threadContextMessages)
+    if (entries[0].parent === true && kept[0] !== entries[0] && kept.length > 1) kept[0] = entries[0]
+    return [
+      '[Thread context — prior messages in this thread (not yet in conversation history):]',
+      ...kept.map((entry) => entry.line),
+      '[End of thread context]',
+    ].join('\n')
+  }
+
+  /** Sender mentions followed by configured CC ids, redirected and de-duplicated. */
+  function replyMentionPrefix(mentionUserIds = []) {
+    const ids = []
+    // HMR can reload this module before the plugin config is revalidated;
+    // CC and redirect nobody in that window.
+    const rewrites = config.mentionRewrites ?? {}
+    for (const raw of [...mentionUserIds, ...(config.ccUserIds ?? [])]) {
+      const id = rewrites[raw] ?? raw
+      if (!ids.includes(id)) ids.push(id)
+    }
+    return ids.length > 0 ? ids.map((id) => '<@' + id + '>').join(' ') + ' ' : ''
+  }
+
+  /**
    * Deliver one channel reply, splitting to the configured size cap and
    * converting to mrkdwn. Threaded when threadReplies and the originating
    * message's ts is known. A failed post is logged and dropped: one lost
    * reply must never wedge the socket loop. When the triggering message
    * mentioned us, the FIRST chunk is prefixed with a mention of its author
-   * (after mrkdwn conversion, so the mention is not escaped as text).
+   * plus any CC ids (after mrkdwn conversion, so the mentions are not escaped).
    */
   async function sendReply(record, text) {
     let first = true
     for (const raw of splitMessage(text, config.maxReplyChars)) {
-      const prefix = first === true && record.mentionUserId !== undefined ? '<@' + record.mentionUserId + '> ' : ''
+      const converted = toSlackMrkdwn(raw, mrkdwnOptions)
+      const alreadyMentioned = /^\s*<@!?[UW][A-Z0-9]+/.test(converted)
+      const prefix = first === true && !alreadyMentioned ? replyMentionPrefix(record.mentionUserIds) : ''
       first = false
-      const body = prefix + toSlackMrkdwn(raw, mrkdwnOptions)
+      const body = prefix + converted
       // Safety valve: escaping can grow a chunk past the intended cap.
       for (const piece of splitMessage(body, config.maxReplyChars + 64)) {
         try {
@@ -248,13 +412,18 @@ export function apply(ctx, config) {
     }
   }
 
-  /** Submit one channel message to the agent as a fresh follow-up turn. */
-  function startTurn(record, text, eventTs, mentionUserId, threadTs) {
+  /**
+   * Submit one prompt to the agent as a fresh follow-up turn.
+   * @param ackTs - the messages it answers; their receipt reactions clear when it settles.
+   * @param mentionUserIds - authors to mention back in the reply.
+   */
+  function startTurn(record, text, { ackTs = [], mentionUserIds = [], threadTs }) {
     record.busy = true
-    record.threadTs = threadTs ?? eventTs
-    record.eventTs = eventTs
-    /** The author to mention back in this turn's reply, when they used one. */
-    record.mentionUserId = mentionUserId
+    record.threadTs = threadTs ?? ackTs.at(-1)
+    record.ackTs = ackTs
+    record.mentionUserIds = mentionUserIds
+    /** When the turn started: a restart saves it as interrupted. */
+    record.turnStartedAt = Date.now()
     record.collector ??= createTurnCollector()
     record.collector.clear()
     try {
@@ -265,11 +434,158 @@ export function apply(ctx, config) {
     }
   }
 
-  /** Send the next queued message, if the channel agent is free again. */
-  async function drain(record) {
-    if (record.busy || record.queue.length === 0) return
-    const next = record.queue.shift()
-    startTurn(record, next.text, next.ts, next.mentionUserId, next.threadTs)
+  // Turn gate: with maxConcurrentTurns set, at most that many channel turns
+  // run at once across all conversations (2026-10-23: up to seven thread
+  // sessions ran together and kept the NVIDIA account rate-limited). Waiting
+  // messages stay in their conversation's queue; each carries an arrival
+  // number so a freed slot goes to the oldest one, whichever thread it is in.
+  // Running and waiting are read off the live records, so a session replaced
+  // by !new or disposed mid-turn can never keep a slot.
+  //
+  // A conversation keeps at most ONE waiting entry (2026-10-24): every later
+  // message for it joins that entry and is answered in the same turn. While
+  // one ten-hour turn held the only slot, the other agents kept posting
+  // progress checks and re-requests to the waiting threads; each became a
+  // turn of its own and the queue grew from 6 to 39 messages. Joined, a
+  // waiting thread costs one turn however often it is pinged.
+  const turnLimit = config.maxConcurrentTurns ?? 0
+  let arrivals = 0
+  /** Set by teardown: no new turn starts once the snapshot is taken. */
+  let closing = false
+
+  /** Channel turns running now. */
+  function runningTurns() {
+    return sessions.all().filter((record) => record.busy === true).length
+  }
+
+  /** "N threads waiting in all" — conversations with a waiting entry. */
+  function waitingLabel() {
+    const count = sessions.all().filter((record) => record.queue.length > 0).length
+    return count + (count === 1 ? ' thread' : ' threads') + ' waiting in all'
+  }
+
+  /**
+   * Whether a message for an idle conversation must wait for a turn slot:
+   * every slot is taken, or an older message already waits for one.
+   */
+  function mustWait() {
+    if (turnLimit === 0) return false
+    if (runningTurns() >= turnLimit) return true
+    return sessions.all().some((record) => record.busy !== true && record.queue.length > 0)
+  }
+
+  /**
+   * Hold messages until a slot (and the conversation) is free. The first
+   * waiting message opens the conversation's entry and keeps its place in
+   * line; later ones join it.
+   * @param incoming - { parts: [{ who, text }], ackTs, mentionUserIds, threadTs }.
+   * @returns whether this call opened the entry (false: it joined one).
+   */
+  function enqueue(record, incoming) {
+    let entry = record.queue[0]
+    const opened = entry === undefined
+    if (opened) {
+      entry = { parts: [], ackTs: [], mentionUserIds: [], threadTs: incoming.threadTs, arrival: ++arrivals }
+      record.queue.push(entry)
+    }
+    for (const part of incoming.parts) {
+      // Bots re-post the same request word for word; one copy is enough.
+      if (!entry.parts.some((seen) => seen.who === part.who && seen.text === part.text)) entry.parts.push(part)
+    }
+    for (const ts of incoming.ackTs ?? []) if (!entry.ackTs.includes(ts)) entry.ackTs.push(ts)
+    for (const id of incoming.mentionUserIds ?? []) if (!entry.mentionUserIds.includes(id)) entry.mentionUserIds.push(id)
+    return opened
+  }
+
+  /** One waiting entry as a prompt: a lone message as posted, several as one labelled block. */
+  function entryPrompt(entry) {
+    if (entry.parts.length === 1) return entry.parts[0].text
+    const count = entry.parts.length
+    return [
+      '[' + count + ' messages reached this thread while it waited for a turn, oldest first. Answer them together in one reply: later ones may repeat, update or replace earlier ones.]',
+      ...entry.parts.map((part, index) => '--- message ' + (index + 1) + ' of ' + count + ' (' + part.who + ') ---\n' + part.text),
+      '[end of waiting messages]',
+    ].join('\n\n')
+  }
+
+  /** Start queued entries while slots are free: oldest arrival first, one turn per conversation. */
+  function pump() {
+    for (;;) {
+      if (closing) return
+      if (turnLimit !== 0 && runningTurns() >= turnLimit) return
+      let next
+      for (const record of sessions.all()) {
+        if (record.busy === true || record.queue.length === 0) continue
+        if (next === undefined || record.queue[0].arrival < next.queue[0].arrival) next = record
+      }
+      if (next === undefined) return
+      const entry = next.queue.shift()
+      startTurn(next, entryPrompt(entry), entry)
+    }
+  }
+
+  /**
+   * The note that resumes a turn a restart caught running (the session still
+   * holds its work). Worded for both outcomes: an owned session's turn is
+   * stopped by the restart, a joined one (held by the host) runs on.
+   */
+  function interruptedNote(startedAt, stoppedAt) {
+    const since = startedAt === undefined ? '' : ' (running since ' + new Date(startedAt).toISOString() + ')'
+    return '[Channel note: the Slack channel restarted at ' + stoppedAt + ' while your turn in this thread was running' + since
+      + ', so nothing from that turn reached Slack. If it was stopped, check where that work stands and finish it; then reply with the result.]'
+  }
+
+  /** Running turns (as interrupted) and waiting entries, in the order the next mount should queue them. */
+  function pendingSnapshot() {
+    const stoppedAt = new Date().toISOString()
+    const running = []
+    const waiting = []
+    for (const record of sessions.all()) {
+      const where = { key: record.key, channel: record.chatId }
+      if (record.busy === true) {
+        running.push({
+          ...where,
+          order: record.turnStartedAt ?? 0,
+          threadTs: record.threadTs,
+          ackTs: record.ackTs ?? [],
+          mentionUserIds: record.mentionUserIds ?? [],
+          parts: [{ who: 'channel', text: interruptedNote(record.turnStartedAt, stoppedAt) }],
+          interrupted: true,
+        })
+      }
+      for (const entry of record.queue) {
+        waiting.push({ ...where, order: entry.arrival, threadTs: entry.threadTs, ackTs: entry.ackTs, mentionUserIds: entry.mentionUserIds, parts: entry.parts })
+      }
+    }
+    running.sort((a, b) => a.order - b.order)
+    waiting.sort((a, b) => a.order - b.order)
+    return [...running, ...waiting].map(({ order, ...entry }) => entry)
+  }
+
+  /** Queue the entries a previous mount saved, then start what fits (runs first on the event chain). */
+  async function restorePending(saved) {
+    const interrupted = []
+    for (const entry of saved) {
+      let record
+      try {
+        record = await sessions.get(entry.key, { channel: entry.channel })
+      } catch (error) {
+        logger.warn('could not restore the waiting messages of ' + entry.key + ': ' + errorText(error))
+        void sendReplyText(entry.channel, entry.threadTs, 'A channel restart lost ' + Math.max(entry.ackTs.length, 1) + ' waiting message(s) here: this thread\'s session is open in another DSH process. Post again once it is closed there. (' + errorText(error) + ')')
+        continue
+      }
+      record.collector ??= createTurnCollector()
+      // The saved prompt already carries any thread history a fresh session needs.
+      record.fresh = false
+      enqueue(record, entry)
+      if (entry.interrupted === true && !interrupted.includes(record)) interrupted.push(record)
+    }
+    logger.info('restored ' + saved.length + ' waiting entr(ies) after a restart')
+    pump()
+    for (const record of interrupted) {
+      if (record.busy === true || record.queue.length === 0) continue
+      void sendReplyText(record.chatId, record.queue[0].threadTs, 'Queued: the turn running here was stopped by a channel restart; it resumes when a turn slot is free (' + waitingLabel() + ').')
+    }
   }
 
   /** One turn ended: reduce collected texts to a reply and release the channel. */
@@ -286,13 +602,13 @@ export function apply(ctx, config) {
     }
     record.lastError = undefined
     if (text !== undefined) await sendReply(record, text)
-    if (config.ackReaction !== '' && record.eventTs !== undefined) {
-      void slack.unreact(record.chatId, record.eventTs, config.ackReaction)
+    if (config.ackReaction !== '') {
+      for (const ts of record.ackTs ?? []) void slack.unreact(record.chatId, ts, config.ackReaction)
     }
-    record.eventTs = undefined
-    record.mentionUserId = undefined
+    record.ackTs = []
+    record.mentionUserIds = []
     record.busy = false
-    await drain(record)
+    pump()
   }
 
   // Resolve this bot's own identity once, so the event filter can drop only
@@ -337,6 +653,7 @@ export function apply(ctx, config) {
       settleTurn(record, event.data.turn, event.data.reason).catch((error) => {
         logger.warn('reply settlement failed: ' + errorText(error))
         record.busy = false
+        pump()
       })
     }
   })
@@ -387,6 +704,7 @@ export function apply(ctx, config) {
     const rootTs = threadRootOf(event)
     const conversation = conversationOf(channel, rootTs)
     const inThread = rootTs !== event.ts
+    const isAppMessage = typeof event.bot_id === 'string' && event.bot_id.length > 0
 
     // Pairing is the one command an unauthorized channel may use: an
     // operator secret enrolls the channel without a host restart. A wrong
@@ -411,6 +729,10 @@ export function apply(ctx, config) {
       return
     }
 
+    // A human message makes the conversation human again: give a bot chain
+    // that was close to the cap a fresh budget. Commands count too.
+    if (isAppMessage === false) resetBotGuard(conversation)
+
     if (command === 'start' || command === 'help') return sendReplyText(channel, rootTs, HELP_TEXT)
     if (command === 'id' || command === 'channelid') return sendReplyText(channel, rootTs, channel)
     if (command === 'new') {
@@ -420,10 +742,18 @@ export function apply(ctx, config) {
         return sendReplyText(channel, rootTs, 'Every new thread already starts its own session — post !new inside a thread to reset that thread.')
       }
       await sessions.get(conversation, { fresh: true, channel })
+      // The replaced session may have held a turn slot.
+      pump()
       return sendReplyText(channel, rootTs, config.sessionScope === 'thread' ? 'Started a fresh session for this thread.' : 'Started a fresh session.')
     }
     if (command === 'stop') {
       const record = sessions.record(conversation)
+      if (record !== undefined && record.busy !== true && record.queue.length > 0) {
+        // Nothing runs here, but messages wait for a turn slot: drop them.
+        const dropped = Math.max(record.queue[0].ackTs.length, 1)
+        record.queue.length = 0
+        return sendReplyText(channel, rootTs, 'Cleared ' + dropped + ' waiting message' + (dropped === 1 ? '' : 's') + '.')
+      }
       if (record === undefined || record.busy !== true) return sendReplyText(channel, rootTs, 'Nothing is running.')
       record.queue.length = 0
       record.collector?.clear()
@@ -464,14 +794,19 @@ export function apply(ctx, config) {
       return
     }
 
+    // This message would drive a turn. If it is the (maxBotTurns + 1)th app
+    // message in a row, drop it without a reply: answering is what would keep
+    // the other agent's turn alive.
+    if (isAppMessage && tripBotGuard(conversation, text)) return
+
     let record
     try {
       record = await sessions.get(conversation, { channel })
     } catch (error) {
-      // Most notably the single-owner rule: the mapped session is currently
-      // open in another surface (the web UI). Say so instead of forking a
-      // fresh session behind the user's back.
-      return sendReplyText(channel, rootTs, 'This session is currently open in the DSH web interface — close or leave it there, then post here again. (' + errorText(error) + ')')
+      // Most notably the single-owner rule: the mapped session is held by
+      // another DSH process (a session live in this one is joined instead).
+      // Say so instead of forking a fresh session behind the user's back.
+      return sendReplyText(channel, rootTs, 'This thread\'s session is open in another DSH process — close it there, then post here again. (' + errorText(error) + ')')
     }
     record.collector ??= createTurnCollector()
 
@@ -481,26 +816,45 @@ export function apply(ctx, config) {
       void slack.react(channel, event.ts, config.ackReaction)
     }
 
+    // A session created for a reply in an existing thread has none of the
+    // thread's earlier messages: its first turn opens with them (Hermes-style
+    // backfill). Only that first turn — the session remembers from then on.
+    const backfill = record.fresh === true && inThread && config.sessionScope === 'thread'
+    record.fresh = false
+
     // A mention-driven turn opens with the messages the agent has not seen,
     // so answering "what do you think?" still knows what was discussed.
-    const unseen = isSelfMention(text) ? takeUnseenContext(unseenKey) : undefined
-    const prompt = unseen === undefined ? text : unseen + '\n\n' + text
+    const unseen = isSelfMention(text) ? takeUnseen(unseenKey) : []
+    const history = backfill ? await threadContext(channel, rootTs, event.ts, new Set(unseen.map((message) => message.ts))) : undefined
+    const prompt = [history, unseenBlock(unseen), text].filter((part) => part !== undefined).join('\n\n')
 
+    const target = mentionBackTarget(event, text)
+    const incoming = { parts: [{ who: speakerLabel(event), text: prompt }], ackTs: [event.ts], mentionUserIds: target === undefined ? [] : [target], threadTs: rootTs }
+    // Only the message that opens a waiting entry is acknowledged in words;
+    // one that joins it gets the receipt reaction alone. The ack says so,
+    // because the agents that kept re-asking read a fresh "Queued" as a cue
+    // to ask again.
+    const joinNote = ' Later messages here join this request and are answered in the same turn — no need to post again.'
     if (record.busy) {
-      record.queue.push({ text: prompt, ts: event.ts, threadTs: rootTs, mentionUserId: mentionBackTarget(event, text) })
-      if (config.ackQueued === false) return
+      const opened = enqueue(record, incoming)
       // A queue behind a prompt is not the agent thinking: say what it waits
       // for, so a silent channel is never mistaken for a wedged one.
-      const waiting = interactions.hasPending(conversation) ? ' Answer the prompt above to continue.' : ''
-      return sendReplyText(channel, rootTs, 'Queued (' + record.queue.length + ' pending).' + waiting)
+      const prompting = interactions.hasPending(conversation)
+      if (config.ackQueued === false || (opened === false && prompting === false)) return
+      return sendReplyText(channel, rootTs, 'Queued: this thread\'s turn is still running.' + (prompting ? ' Answer the prompt above to continue.' : '') + joinNote)
     }
-    startTurn(record, prompt, event.ts, mentionBackTarget(event, text), rootTs)
+    if (mustWait()) {
+      const opened = enqueue(record, incoming)
+      if (config.ackQueued === false || opened === false) return
+      return sendReplyText(channel, rootTs, 'Queued: another conversation\'s turn is running (' + waitingLabel() + ').' + joinNote)
+    }
+    startTurn(record, prompt, incoming)
   }
 
   /** Post a control/notice message (commands, acks) into a thread. */
   async function sendReplyText(channel, ts, text) {
     for (const raw of splitMessage(text, config.maxReplyChars)) {
-      const body = toSlackMrkdwn(raw, mrkdwnOptions)
+      const body = replyMentionPrefix(undefined) + toSlackMrkdwn(raw, mrkdwnOptions)
       try {
         await slack.postMessage(channel, body, {
           threadTs: config.threadReplies === true ? ts : undefined,
@@ -518,7 +872,14 @@ export function apply(ctx, config) {
   // loop must never run two handleEvent passes concurrently (a /new racing
   // the previous message's session creation would orphan sessions), exactly
   // like the Telegram sibling's sequential poll loop.
-  let eventChain = Promise.resolve()
+  // What a previous mount saved is read now, synchronously: dsh-hmr disposes
+  // the old instance (which saves first thing) before it mounts this one.
+  // Queuing it again opens the event chain, ahead of every new message, once
+  // our identity is known (the plugin is up; sessions are created after it).
+  const restored = takePending(pendingPath, logger)
+  let eventChain = restored.length === 0
+    ? Promise.resolve()
+    : identityProbe.then(() => restorePending(restored)).catch((error) => logger.warn('restoring waiting messages failed: ' + errorText(error)))
   const socketLoop = runSocketLoop({
     slack,
     onEvent: (event) => {
@@ -546,6 +907,10 @@ export function apply(ctx, config) {
 
   /** Full teardown: stop the socket loop, unsubscribe, dispose sessions. */
   async function teardown() {
+    // Saved before anything else and synchronously: the next mount reads the
+    // file as soon as this disposal is done. No turn starts after this point.
+    closing = true
+    savePending(pendingPath, pendingSnapshot(), logger)
     abort.abort()
     try {
       await socketLoop

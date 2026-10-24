@@ -223,6 +223,62 @@ test('a reply mentions only the allowlisted ids', async () => {
   }
 })
 
+test('a redirected id is posted as its successor in the text and the CC prefix', async () => {
+  // 2026-10-23: wagyu kept being pinged; its mentions now go to Muse instead.
+  const mock = await startMockSlack()
+  mock.setHandler((method) => {
+    if (method === 'auth.test') return { reply: { ok: true, bot_id: 'B-SELF', user_id: 'U-BOT' } }
+    return undefined
+  })
+  try {
+    const h = await mountConnected(mock, { ccUserIds: ['U-WAGYU'], mentionRewrites: { 'U-WAGYU': 'U-MUSE' } })
+    await waitFor(() => h.sockets.length > 0 && h.sockets[0].listeners.message?.length > 0)
+    await waitFor(() => mock.calls.some((c) => c.method === 'auth.test'))
+    await sleep(200)
+
+    h.push(messageEvent('C42', '<@U-BOT> first'))
+    await waitFor(() => h.created.length === 1)
+    h.created[0].script.push('<@U-WAGYU> owner さんの実機確認枠')
+    h.push(messageEvent('C42', '<@U-BOT> second'))
+
+    await waitFor(() => h.sent().some((s) => s.text.includes('実機確認枠')))
+    const body = h.sent().map((s) => s.text).find((t) => t.includes('実機確認枠'))
+    assert(!body.includes('U-WAGYU'), 'the retired id never reaches Slack: ' + body)
+    assert(body.includes('<@U-MUSE> owner さんの実機確認枠'), 'the successor is a real mention: ' + body)
+    const prefixed = h.sent().map((s) => s.text)
+    assert(prefixed.every((t) => !t.includes('U-WAGYU')), 'CC prefixes are redirected too: ' + JSON.stringify(prefixed))
+    await h.dispose()
+  } finally {
+    await mock.close()
+  }
+})
+
+test('only the listed apps are mentioned back while mentionBackBots is off', async () => {
+  // 2026-10-23: DSH answered Muse (an orchestrator app) with its id escaped as text, so Muse never got the reply.
+  const mock = await startMockSlack()
+  mock.setHandler((method) => {
+    if (method === 'auth.test') return { reply: { ok: true, bot_id: 'B-SELF', user_id: 'U-BOT' } }
+    return undefined
+  })
+  try {
+    const h = await mountConnected(mock, { mentionBackBots: false, mentionBackBotIds: ['U-MUSE'] })
+    await waitFor(() => h.sockets.length > 0 && h.sockets[0].listeners.message?.length > 0)
+    await waitFor(() => mock.calls.some((c) => c.method === 'auth.test'))
+    await sleep(200)
+
+    h.push(messageEvent('C42', '<@U-BOT|DSH> muse ping', { bot_id: 'B-MUSE', user: 'U-MUSE' }))
+    await waitFor(() => h.sent().some((s) => s.text === '<@U-MUSE> pong'))
+
+    const before = h.sent().length
+    h.push(messageEvent('C42', '<@U-BOT> other app ping', { bot_id: 'B-OTHER', user: 'U-APP', ts: '1700000002.001' }))
+    await waitFor(() => h.sent().length > before)
+    assert(h.sent().slice(before).every((s) => s.text === 'pong'), 'unlisted apps are answered without a ping')
+    await h.dispose()
+  } finally {
+    await mock.close()
+  }
+})
+
 test('a mention is answered with a mention of its author', async () => {
   const mock = await startMockSlack()
   mock.setHandler((method) => {
@@ -230,7 +286,7 @@ test('a mention is answered with a mention of its author', async () => {
     return undefined
   })
   try {
-    const h = await mountConnected(mock)
+    const h = await mountConnected(mock, { mentionBackBots: true })
     await waitFor(() => h.sockets.length > 0 && h.sockets[0].listeners.message?.length > 0)
     await waitFor(() => mock.calls.some((c) => c.method === 'auth.test'))
     await sleep(200) // let the probe store our user id
@@ -253,6 +309,128 @@ test('a mention is answered with a mention of its author', async () => {
     await sleep(200)
     equal(h.sent().length, sentAfterApp, 'own echo still ignored')
 
+    await h.dispose()
+  } finally {
+    await mock.close()
+  }
+})
+
+test('an app mention is answered without pinging the app back by default', async () => {
+  const mock = await startMockSlack()
+  mock.setHandler((method) => {
+    if (method === 'auth.test') return { reply: { ok: true, bot_id: 'B-SELF', user_id: 'U-BOT' } }
+    return undefined
+  })
+  try {
+    const h = await mountConnected(mock)
+    await waitFor(() => h.sockets.length > 0 && h.sockets[0].listeners.message?.length > 0)
+    await waitFor(() => mock.calls.some((c) => c.method === 'auth.test'))
+    await sleep(200)
+
+    h.push(messageEvent('C42', '<@U-BOT> app ping', { bot_id: 'B-OTHER', user: 'U-APP' }))
+    await waitFor(() => h.created.length === 1 && h.created[0].followups.length === 1)
+    h.created[0].complete('pong')
+    const reply = await waitFor(() => h.sent().find((s) => s.text === 'pong'))
+    assert(reply !== undefined, 'the app is answered')
+    equal(reply.text, 'pong', 'no automatic mention back at the app')
+    await h.dispose()
+  } finally {
+    await mock.close()
+  }
+})
+
+test('maxBotTurns caps a bot chain and a human resets it', async () => {
+  const mock = await startMockSlack()
+  mock.setHandler((method) => {
+    if (method === 'auth.test') return { reply: { ok: true, bot_id: 'B-SELF', user_id: 'U-BOT' } }
+    return undefined
+  })
+  try {
+    const h = await mountConnected(mock, { maxBotTurns: 2 })
+    await waitFor(() => h.sockets.length > 0 && h.sockets[0].listeners.message?.length > 0)
+    await waitFor(() => mock.calls.some((c) => c.method === 'auth.test'))
+    await sleep(200) // let the probe store our user id
+    const thread = { thread_ts: '1700000001.000' }
+
+    h.push(messageEvent('C42', '<@U-BOT> one', { bot_id: 'B-OTHER', user: 'U-APP', ...thread }))
+    await waitFor(() => h.created.length === 1 && h.created[0].followups.length === 1)
+    await waitFor(() => h.sent().some((s) => s.text === 'pong'))
+
+    h.created[0].script.push('pong-2')
+    h.push(messageEvent('C42', '<@U-BOT> two', { bot_id: 'B-OTHER', user: 'U-APP', ...thread }))
+    await waitFor(() => h.created[0].followups.length === 2)
+    await waitFor(() => h.sent().some((s) => s.text === 'pong-2'))
+
+    // Third app message in a row: dropped without a reply or a turn.
+    h.push(messageEvent('C42', '<@U-BOT> three', { bot_id: 'B-OTHER', user: 'U-APP', ...thread }))
+    await sleep(200)
+    equal(h.created[0].followups.length, 2, 'third app message is dropped')
+
+    // A human message resets the budget; the next app message is answered.
+    h.created[0].script.push('human-answer')
+    h.push(messageEvent('C42', 'human here', thread))
+    await waitFor(() => h.created[0].followups.length === 3)
+    await waitFor(() => h.sent().some((s) => s.text === 'human-answer'))
+
+    h.created[0].script.push('pong-4')
+    h.push(messageEvent('C42', '<@U-BOT> four', { bot_id: 'B-OTHER', user: 'U-APP', ...thread }))
+    await waitFor(() => h.created[0].followups.length === 4, 2000)
+    equal(h.created[0].followups.length, 4, 'a human reset reopened the budget')
+    await waitFor(() => h.sent().some((s) => s.text === 'pong-4'))
+    await h.dispose()
+  } finally {
+    await mock.close()
+  }
+})
+
+test('a varied bot collaboration runs to the turn ceiling, not two turns', async () => {
+  const mock = await startMockSlack()
+  mock.setHandler((method) => {
+    if (method === 'auth.test') return { reply: { ok: true, bot_id: 'B-SELF', user_id: 'U-BOT' } }
+    return undefined
+  })
+  try {
+    const h = await mountConnected(mock, { maxBotTurns: 4, maxBotRepeats: 3 })
+    await waitFor(() => h.sockets.length > 0 && h.sockets[0].listeners.message?.length > 0)
+    await waitFor(() => mock.calls.some((c) => c.method === 'auth.test'))
+    await sleep(200)
+    const thread = { thread_ts: '1700000001.000' }
+
+    for (let i = 1; i <= 4; i += 1) {
+      h.push(messageEvent('C42', '<@U-BOT> progress ' + i + ' with new facts', { bot_id: 'B-OTHER', user: 'U-APP', ...thread }))
+      await waitFor(() => h.created.length === 1 && h.created[0].followups.length === i, 3000)
+    }
+    equal(h.created[0].followups.length, 4, 'four varied progress reports are answered')
+
+    h.push(messageEvent('C42', '<@U-BOT> progress 5 with new facts', { bot_id: 'B-OTHER', user: 'U-APP', ...thread }))
+    await sleep(200)
+    equal(h.created[0].followups.length, 4, 'the turn ceiling is a backstop')
+    await h.dispose()
+  } finally {
+    await mock.close()
+  }
+})
+
+test('the same bot text trips the repetition guard before the turn ceiling', async () => {
+  const mock = await startMockSlack()
+  mock.setHandler((method) => {
+    if (method === 'auth.test') return { reply: { ok: true, bot_id: 'B-SELF', user_id: 'U-BOT' } }
+    return undefined
+  })
+  try {
+    const h = await mountConnected(mock, { maxBotTurns: 10, maxBotRepeats: 2 })
+    await waitFor(() => h.sockets.length > 0 && h.sockets[0].listeners.message?.length > 0)
+    await waitFor(() => mock.calls.some((c) => c.method === 'auth.test'))
+    await sleep(200)
+    const thread = { thread_ts: '1700000001.000' }
+
+    for (let i = 1; i <= 2; i += 1) {
+      h.push(messageEvent('C42', '<@U-BOT> （なし）', { bot_id: 'B-OTHER', user: 'U-APP', ...thread }))
+      await waitFor(() => h.created.length === 1 && h.created[0].followups.length === i, 3000)
+    }
+    h.push(messageEvent('C42', '<@U-BOT> （なし）', { bot_id: 'B-OTHER', user: 'U-APP', ...thread }))
+    await sleep(200)
+    equal(h.created[0].followups.length, 2, 'third identical text is dropped')
     await h.dispose()
   } finally {
     await mock.close()

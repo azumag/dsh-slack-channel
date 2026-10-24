@@ -175,6 +175,43 @@ independent session (`/new` starts a fresh one) rooted in that workspace,
 carrying the same route, permission preset, agent preset, and persistence as
 the web interface.
 
+**Route and fallback chain.** `provider`/`model` pin the primary route for every
+channel session. `fallbacks` lists further routes, tried in order: when a model
+request fails, the failed step is retried on the next route inside the same
+turn, so the channel still gets an answer. Retryable failures (`RATE_LIMIT`,
+`SERVER`, `TIMEOUT`, `TRANSPORT`, `EMPTY_RESPONSE`) move on only after the
+provider's own retry policy (llm-retry, 5 attempts by default) has given up;
+the rest — `QUOTA` (which includes the DeepSeek API's HTTP 402 insufficient
+balance), auth errors, an unknown model — move on at once. A stopped turn never
+does. The rest of the turn stays on the route it reached, and every new turn
+starts again on the primary route, so a route that recovers (a lifted rate
+limit, a topped-up balance) is used again. With `fallbackCooldownMs` the
+primary is also tried again inside the turn once that long has passed since
+the last switch — a long turn no longer spends every remaining step on a
+fallback after one short rate-limit burst; a primary that still fails walks the
+chain again from its first route. Entries that repeat the primary or an
+earlier entry are skipped. Each switch is logged as a warning (`model request
+failed on … retrying this turn on … (fallback n/m)`).
+
+```yaml
+provider: nvidia
+model: z-ai/glm-5.3
+fallbacks:
+  - { provider: nvidia, model: moonshotai/kimi-k2.6 }
+  - { provider: nvidia, model: z-ai/glm-5.3-flash }
+  - { provider: nvidia, model: deepseek-ai/deepseek-v4.1-flash }
+  - { provider: opencode-go, model: deepseek-v4.1-flash }
+  - { provider: deepseek-official, model: deepseek-flash }   # DeepSeek-V4.1-Flash-1017
+```
+
+llm-retry keeps one retry budget per provider and step, so after the primary
+exhausted NVIDIA's retries, the next NVIDIA routes in the same step get one
+attempt each for a retryable failure before the chain moves on; a later step
+gets the full budget again. `fallbackOn: quota` restricts the chain to budget
+failures (`QUOTA` / `ACCOUNT_QUOTA`). The older single-route form
+`fallbackProvider` / `fallbackModel` (/ `fallbackReasoningEffort`) still works
+as a one-entry chain.
+
 ## Full configuration reference
 
 | Key | Default | Meaning |
@@ -183,6 +220,10 @@ the web interface.
 | `appToken` | `SLACK_APP_TOKEN` env | App-level token (`xapp-`) for Socket Mode. |
 | `apiBase` | `https://slack.com/api` | Web API base; point at a mock for tests. |
 | `provider` / `model` | host default | Agent route for created sessions. |
+| `fallbacks` | `[]` | Ordered fallback routes, each `{ provider, model, reasoningEffort? }`. After a failed model request the step is retried on the next route in the same turn; the next turn starts on the primary route again. See *Route and fallback chain*. |
+| `fallbackOn` | `any` | Which failures move down the chain: `any` (every failure except a stopped turn; retryable ones after the provider's retries are spent) or `quota` (`QUOTA` / `ACCOUNT_QUOTA` only). |
+| `fallbackCooldownMs` | `0` | Milliseconds on a fallback route before the primary is tried again within the same turn. `0` keeps the fallback until the turn ends. |
+| `fallbackProvider` / `fallbackModel` / `fallbackReasoningEffort` | — | Single-route shorthand for a one-entry `fallbacks`; cannot be combined with `fallbacks`. |
 | `cwd` | server cwd | Workspace root for created sessions (must be absolute). |
 | `channelCwd` | — | Per-channel workspace override: `{ "C…": "/abs/path" }`. Lets a Slack sidebar section (channels grouped per project) agree with DSH workspaces. |
 | `permissionPreset` | composition default | Named preset applied to each freshly created session — the same table the web UI's preset switcher offers (`workspace-write`, `danger-full-access`, …). Resumed sessions keep their existing knobs. |
@@ -190,7 +231,7 @@ the web interface.
 | `allowedChannelIds` | `[]` | Channel allowlist. Empty + `allowAllChannels: false` denies everything. |
 | `allowAllChannels` | `false` | Explicitly serve every channel the bot is in. |
 | `notifyUnauthorized` | `false` | Reply "not authorized" to rejected channels. |
-| `stateFile` | — | JSON file persisting channel → session ids and /pair enrollments. |
+| `stateFile` | — | JSON file persisting channel → session ids and /pair enrollments. Beside it, `<name>.pending.json` carries waiting messages and running turns across a plugin reload or host restart: teardown writes it, the next mount queues them again (a caught turn resumes with a channel note) and renames the file to `.pending.json.restored`. |
 | `pairToken` | — | Enables the enrollment flow (requires `stateFile`). |
 | `sessionScope` | `channel` | `channel`: one session per channel (threads share it). `thread`: one session per Slack thread — a top-level message opens a new session, replies in its thread continue it; queues, `!stop`, `!new`, prompts and unseen context stay inside the thread. |
 | `replyMode` | `last` | `last`: final assistant message of a turn; `all`: join every assistant message. |
@@ -198,8 +239,17 @@ the web interface.
 | `threadReplies` | `true` | Reply in-thread under the originating message's thread root (a reply in a thread is answered in that same thread). |
 | `ackReaction` | `hourglass` | Emoji reaction marking the message being worked on (empty string disables). |
 | `mentionOnly` | `false` | Serve only messages that address the bot (or one of its commands). DMs are never gated. Messages that are gated become context, not silence — see below. |
+| `maxBotTurns` | `10` | Backstop ceiling on app-driven turns in one conversation since the last human message (a human message resets it; `0` disables the ceiling). |
+| `maxBotRepeats` | `3` | How many times the same normalized text (mentions stripped) may drive a turn in one conversation before it is dropped. This is the primary ping-pong brake; `0` disables it. |
+| `maxConcurrentTurns` | `0` | How many channel turns may run at once across all conversations. A message that finds every slot taken waits in its conversation's queue (acked with `Queued: another conversation's turn is running`) and starts, oldest first, when a turn ends. A conversation holds at most one waiting entry: later messages to it (progress checks, re-requests) join that entry without a second ack — only the receipt reaction — and are answered together in one turn, so pinging a waiting thread never adds turns. `!stop` in a waiting thread drops its waiting messages. `0` means no limit. Turns the host starts itself (scheduled reminders, goal rounds) are not counted. |
+| `mentionBackBots` | `false` | Mention the author back when the author is another app. Off by default: the automatic mention is what closes a two-agent loop. |
 | `mentionUserIds` | `[]` | Slack user ids (`U…`) the agent's own text may turn into a real mention. Empty keeps every agent-written `<@U…>` as escaped text — see below. |
+| `mentionRewrites` | `{}` | Map of Slack user id → user id. Every outbound mention of a key (agent text — escaped or not, with or without a label — and the automatic sender/CC prefix) is posted as a real mention of its value instead, so a retired id is never pinged even when the agent copies it from another bot's roster. |
+| `slackSurface` | `true` | Tell every channel agent it is on Slack: its Web-GUI prompt slot is replaced by "your final reply is posted to this thread", its tool calls may not post to Slack themselves (Slack API writes, webhooks and pasted tokens are refused), and Slack tokens in tool results are shown as `xoxb-<redacted>`. Covers resumed sessions too. |
+| `surfacePrompt` | — | Text appended to that Slack prompt, such as the team roster and house rules. |
+| `ccUserIds` | `[]` | Slack user ids always added after the sender mention on the first reply chunk (for example an orchestrator). Built after mrkdwn conversion, so it does not need to be in `mentionUserIds`. |
 | `contextMessages` | `20` | How many unseen messages a mention-driven turn carries as context (`0` disables the buffer, `200` is the cap). |
+| `threadContextMessages` | `30` | `sessionScope: thread` only: when a reply in an existing thread creates that thread's session (the thread predates the switch to thread scope, or follows `!new` or a restart), its first turn carries up to this many of the thread's earlier messages — see *Thread history backfill* (`0` disables, `200` is the cap). |
 | `interactiveTimeoutMs` | `1800000` (30 min) | How long a Slack approval/question prompt waits before it is settled without an answer (`0` waits until the turn is stopped, `86400000` is the cap). |
 | `retryDelayMs` | `3000` | Backoff after Web API failures. |
 | `socketRetryDelayMs` | `2000` | Backoff between Socket Mode reconnects. |
@@ -218,7 +268,7 @@ Only those ids come back as real mentions; every other `<@U…>` — and every o
 
 Two mentions never need the allowlist:
 
-- The first chunk of a reply is prefixed with a mention of the author of the message that drove the turn, whenever that message addressed the bot. That prefix is added *after* escaping, so it always resolves.
+- The first chunk of a reply is prefixed with a mention of the author of the message that drove the turn, whenever that message addressed the bot and the author is a human. An app's message gets no automatic mention back unless `mentionBackBots: true`; that prefix is added *after* escaping, so it always resolves.
 - Code spans and fenced blocks are never escaped, but Slack renders mentions inside them as code — they stay text.
 
 An empty `mentionUserIds` (the default) is the safe posture for a channel where the agent should never address anyone: only the automatic mention-back above reaches a human or another app.
@@ -240,6 +290,22 @@ Gated messages are not discarded. They are remembered per channel (the last `con
 ```
 
 The block is consumed by that turn, so each unseen message is carried exactly once; the session then holds it as ordinary history. Attribution is the raw mention spelling (`<@U…>`) — the form the agent can address someone with in its reply, provided that id is in `mentionUserIds` (see *Mentions in replies*). Messages longer than 1500 characters are truncated inside the block, and a composition that gates nothing never allocates the buffer at all.
+
+### Thread history backfill
+
+With `sessionScope: thread` a thread's session normally starts with the thread itself, so it has seen everything. A reply can still land in a thread that has no session yet: the thread was started before the switch to thread scope, `!new` was posted in it, or the host restarted without a `stateFile` mapping (the mention-gating buffer above is in memory only). The first turn of such a session opens with the thread so far, fetched with `conversations.replies` (the `channels:history` / `groups:history` / `im:history` scopes the setup already grants):
+
+```
+[Thread context — prior messages in this thread (not yet in conversation history):]
+[thread parent] <@U123>: can you look at the flaky deploy test?
+[assistant] It times out waiting for the health check — see the log above.
+<@U0A1B2C3D4>: the timeout is 30s, the check takes 45s on cold start
+[End of thread context]
+
+<@U123> so what should we change?
+```
+
+One line per message (newlines shown as `⏎`, 1500 characters at most), oldest first, the newest `threadContextMessages` kept with the thread's parent always on top. The triggering message is never part of the block, nor is anything the unseen-message block of the same turn already carries. Edits, joins and other traces are skipped. Later turns get no block — the session remembers from then on — and neither do top-level messages, a resumed session (it already holds its history) nor `sessionScope: channel`. Because `!new` is one of the triggers, a fresh session in an old thread re-reads that thread; start a new top-level thread for a clean slate, or set `threadContextMessages: 0`. A failed fetch (missing scope, network, timeout) is logged as a warning and the turn goes ahead without the block.
 
 ### Interactive prompts (approvals and questions)
 
@@ -297,10 +363,10 @@ There is also a live smoke test without an LLM: `node smoke.mjs` mounts the plug
 - **Text only** — attachments, blocks, and mentions in the incoming message are ignored (only `text` is forwarded); replies are mrkdwn text.
 - **Socket Mode only** — no Events API webhook mode; the plugin holds a websocket in-process.
 - **No slash-command integration** — commands are plain chat text ("!new"); Slack's slash-command payloads are acked and ignored (Block Kit *button* clicks are handled).
-- **One turn per session at a time** — concurrent messages queue; they are not steering. With `sessionScope: thread` the unit is the thread, so other threads are not held up.
+- **One turn per session at a time** — concurrent messages queue (joined into one waiting entry per conversation); they are not steering. With `sessionScope: thread` the unit is the thread, so other threads are not held up — unless `maxConcurrentTurns` caps turns across threads.
 - **Prompts are answered by whoever can post in the channel** — the buttons inherit the channel's trust model (anyone who can drive the agent can also approve its requests). Restrict the channel and the `permissionPreset` rather than relying on the prompt.
 - **A prompt is one message** — a question batch with more options than Slack renders as buttons falls back to a compact `!answer <text>` prompt, and a prompt that Slack rejects (message too large, channel archived) fails closed immediately.
-- **Agents can ping each other** — every message that mentions the bot is answered with a mention of its author, and messages from other apps are served. In a channel where several agent apps all reply to each other, that can sustain a conversation between them. The plugin answers one turn per channel and only when a message arrives, so it is not a runaway loop by itself, but a channel like that is worth watching for cost. An agent's own mentions reach Slack only for ids in `mentionUserIds`, so keep that list to the participants that should be addressable. Gate it further by only forwarding messages that mention the bot, or by skipping `bot_message` senders in `mentionBackTarget`. Also note that a channel where the bot is present is served *whether or not* the bot is mentioned (`allowAllChannels`, or a listed channel): mention-back is not mention-gating.
+- **Agents can ping each other, within a budget** — messages from other apps are served, and the reply used to mention the app back, which could sustain a conversation between two agents. Defaults now bound that in layers: `mentionBackBots: false` (no automatic mention at an app), `maxBotRepeats: 3` (the fourth occurrence of the same normalized text in a conversation is dropped — the actual loop repeated verbatim), `maxBotTurns: 10` (a generous ceiling for varied bot chatter), and the existing `mentionOnly` gate. A human message resets both counters. The guard logs `bot loop guard: staying silent` when it trips. An agent's own mentions still reach Slack only for ids in `mentionUserIds`, so keep that list to the participants that should be addressable. Also note that a channel where the bot is present is served *whether or not* the bot is mentioned (`allowAllChannels`, or a listed channel): mention-back is not mention-gating.
 
 ## Files
 

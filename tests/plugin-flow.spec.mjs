@@ -121,6 +121,22 @@ function messageEvent(channel, text) {
   return { type: 'message', channel, user: 'U1', text, ts: tsCounter + '.001' }
 }
 
+test('ccUserIds are added to the first reply chunk', async () => {
+  const mock = await startMockSlack()
+  try {
+    const h = await mount(mock, { ccUserIds: ['U999CC'] })
+    await waitFor(() => h.sockets.length > 0 && h.sockets[0].listeners.message?.length > 0)
+    h.push(messageEvent('C42', 'hello'))
+    await waitFor(() => h.created.length === 1 && h.created[0].followups.length === 1)
+    h.created[0].complete('answer')
+    const reply = await waitFor(() => h.sent().find((s) => s.text === '<@U999CC> answer'))
+    assert(reply !== undefined, 'CC mention is on the reply')
+    await h.dispose()
+  } finally {
+    await mock.close()
+  }
+})
+
 test('messages posted while busy are queued and drained in order', async () => {
   const mock = await startMockSlack()
   try {

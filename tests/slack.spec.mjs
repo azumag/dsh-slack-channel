@@ -107,3 +107,25 @@ test('splitMessage chunks reconstruct the input', () => {
   for (const chunk of chunks) assert(chunk.length <= 150, 'chunk over limit')
   equal(chunks.join(''), text, 'reconstruction')
 })
+
+test('replies follows the cursor, drops the parent each page repeats, and stops at maxPages', async () => {
+  const mock = await startMockSlack()
+  try {
+    const root = { ts: '100.000001', text: 'root' }
+    mock.setHandler((method, body) => {
+      if (method !== 'conversations.replies') return undefined
+      if (body.cursor === undefined) return { reply: { ok: true, messages: [root, { ts: '100.000002', text: 'a' }], has_more: true, response_metadata: { next_cursor: 'c2' } } }
+      return { reply: { ok: true, messages: [root, { ts: '100.00000' + (body.cursor === 'c2' ? 3 : 4), text: body.cursor }], has_more: body.cursor === 'c2', response_metadata: { next_cursor: body.cursor === 'c2' ? 'c3' : '' } } }
+    })
+    const client = new SlackClient({ apiBase: mock.url, botToken: 'xoxb-t', appToken: 'xapp-t' })
+    const all = await client.replies('C1', root.ts, { latest: '200.000000' })
+    equal(all.map((m) => m.text), ['root', 'a', 'c2', 'c3'], 'every page, parent once')
+    const calls = mock.calls.filter((c) => c.method === 'conversations.replies')
+    equal(calls.map((c) => c.body.cursor ?? null), [null, 'c2', 'c3'])
+    equal([calls[0].body.channel, calls[0].body.ts, calls[0].body.latest, calls[0].token], ['C1', root.ts, '200.000000', 'xoxb-t'])
+    const capped = await client.replies('C1', root.ts, { maxPages: 2 })
+    equal(capped.map((m) => m.text), ['root', 'a', 'c2'], 'maxPages bounds the walk')
+  } finally {
+    await mock.close()
+  }
+})

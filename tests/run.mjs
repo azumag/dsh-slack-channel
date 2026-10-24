@@ -10,6 +10,7 @@ for (const file of [
   'slack.spec.mjs',
   'socket.spec.mjs',
   'sessions.spec.mjs',
+  'surface.spec.mjs',
   'interactions.spec.mjs',
   'plugin.spec.mjs',
   'plugin-flow.spec.mjs',

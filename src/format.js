@@ -45,7 +45,26 @@ export function toSlackMrkdwn(text, options) {
     out.push(escapeInline(line))
   }
   if (inFence) out.push(FENCE)
-  return allowMentions(out.join('\n'), options?.mentionUserIds)
+  return rewriteMentions(allowMentions(out.join('\n'), options?.mentionUserIds), options?.mentionRewrites)
+}
+
+/**
+ * Redirect mentions of retired ids (options.mentionRewrites, id → id) to their
+ * successor as a REAL mention, escaped or not and with any label: the agent
+ * copies ids from other bots' rosters, and the old id must never be pinged
+ * (wagyu → Muse, 2026-10-23). Code spans are rewritten too — the old id stays
+ * out of the post entirely.
+ */
+export function rewriteMentions(text, rewrites) {
+  if (typeof text !== 'string' || rewrites === null || typeof rewrites !== 'object') return text
+  let out = text
+  for (const [from, to] of Object.entries(rewrites)) {
+    if (typeof to !== 'string' || from.length === 0 || to.length === 0) continue
+    const quoted = from.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const pattern = new RegExp('(?:&lt;|<)@' + quoted + '(?:\\|[^&<>]*)?(?:&gt;|>)', 'g')
+    out = out.replace(pattern, '<@' + to + '>')
+  }
+  return out
 }
 
 /**

@@ -29,6 +29,10 @@
         # Agent route for the per-channel sessions this plugin creates.
         # provider: deepseek-official
         # model: deepseek-chat
+        # Fallback chain: a failed model request retries the step on the next
+        # route, in order (fallbackOn: any | quota; default any).
+        # fallbacks:
+        #   - { provider: opencode-go, model: deepseek-v4.1-flash }
         # Workspace root for created agents (default: the server's cwd).
         # cwd: /Users/you/work
         # Per-channel workspace overrides — agree with a Slack sidebar
@@ -58,12 +62,19 @@
         # a top-level message opens a new session and replies in its thread
         # continue it.
         # sessionScope: channel
+        # With 'thread', a reply in an existing thread that has no session yet
+        # (started before the switch, after !new, or after a restart) opens
+        # with up to this many of the thread's earlier messages; 0 disables.
+        # threadContextMessages: 30
         # UX knobs (defaults shown):
         # replyMode: last          # send the final assistant message of a turn
         # threadReplies: true      # reply in-thread on the originating message
         # maxReplyChars: 4000      # split longer replies into chunks
         # ackReaction: hourglass   # "working" emoji; '' disables
         # mentionOnly: false       # serve only messages that address the bot
+        # maxBotTurns: 10          # backstop ceiling on app-driven turns; 0 disables
+        # maxBotRepeats: 3         # drop repeated (normalized) bot text; 0 disables
+        # mentionBackBots: false   # no automatic mention at another app
         #                          # (DMs are never gated); gated messages are
         #                          # kept and handed to the next addressed turn
         # contextMessages: 20      # how many unseen messages that turn carries

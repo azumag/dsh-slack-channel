@@ -2,3 +2,4 @@
 local.patch.yml
 *.state.json
 node_modules/
+.bak-*/

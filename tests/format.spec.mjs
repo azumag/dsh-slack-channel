@@ -1,7 +1,7 @@
 // Slack mrkdwn formatting tests.
 
 import { test, assert, equal } from './_util.mjs'
-import { escapeMrkdwn, toSlackMrkdwn } from '../src/format.js'
+import { escapeMrkdwn, rewriteMentions, toSlackMrkdwn } from '../src/format.js'
 
 const NL = String.fromCharCode(10)
 const FENCE = '```'
@@ -70,4 +70,19 @@ test('the allowlist never unescapes links or other angle brackets', () => {
 
 test('an allowlisted id inside a code span stays code', () => {
   equal(toSlackMrkdwn('run `<@U123ABC>` now', { mentionUserIds: ['U123ABC'] }), 'run `<@U123ABC>` now')
+})
+
+test('a redirected id becomes a real mention of its successor, label or not', () => {
+  // 2026-10-23: the agent copied wagyu's id from another bot's roster; wagyu must never be pinged.
+  const options = { mentionUserIds: [], mentionRewrites: { U0C6HEG8KC6: 'U0CCCH69XMW' } }
+  equal(toSlackMrkdwn('<@U0C6HEG8KC6> owner さん', options), '<@U0CCCH69XMW> owner さん')
+  equal(toSlackMrkdwn('担当 <@U0C6HEG8KC6|owner-wagyu> へ', options), '担当 <@U0CCCH69XMW> へ')
+  equal(toSlackMrkdwn('run `<@U0C6HEG8KC6>` now', options), 'run `<@U0CCCH69XMW>` now', 'code spans too')
+  equal(toSlackMrkdwn('<@U0C6HEG8KC6X> hi', options), '&lt;@U0C6HEG8KC6X&gt; hi', 'a longer id is not a match')
+  equal(toSlackMrkdwn('<@U999ZZZ> hi', options), '&lt;@U999ZZZ&gt; hi', 'other ids keep the allowlist rule')
+})
+
+test('rewriteMentions leaves text alone without a map', () => {
+  equal(rewriteMentions('<@U0C6HEG8KC6>', undefined), '<@U0C6HEG8KC6>')
+  equal(rewriteMentions(undefined, { U0C6HEG8KC6: 'U0CCCH69XMW' }), undefined)
 })
