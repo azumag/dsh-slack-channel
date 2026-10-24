@@ -167,9 +167,13 @@ const keyNames = existsSync(opts['keys-file'])
   : []
 const routes = chainRoutes(opts['slack-patch'])
 const needKey = { nvidia: 'NVIDIA_API_KEY', 'opencode-go': 'OPENCODE_GO_API_KEY', 'deepseek-official': 'DEEPSEEK_API_KEY' }
-const missing = [...new Set(routes.map((route) => needKey[route.provider]).filter((name) => name && !keyNames.includes(name)))]
-if (missing.length === 0) ok('model API keys', keyNames.join(', ') + ' in ' + opts['keys-file'] + ' (values not shown)')
-else bad('model API keys', 'missing ' + missing.join(', ') + ' in ' + opts['keys-file'])
+// web_search / web_fetch through DeepSeek's Search & Fetch API take DEEPSEEK_API_KEY even with no DeepSeek model.
+const homePatch = join(process.env.DSH_HOME ?? '', 'cordis.patch.yml')
+const deepseekWeb = existsSync(homePatch) && /\b(searchProvider|fetchProvider):\s*deepseek-(search|fetch)-api\b/.test(readFileSync(homePatch, 'utf8'))
+const wanted = [...new Set([...routes.map((route) => needKey[route.provider]), ...deepseekWeb ? ['DEEPSEEK_API_KEY'] : []].filter(Boolean))]
+const missing = wanted.filter((name) => !keyNames.includes(name))
+if (missing.length === 0) ok('API keys', keyNames.join(', ') + ' in ' + opts['keys-file'] + ' (values not shown)')
+else bad('API keys', 'missing ' + missing.join(', ') + ' in ' + opts['keys-file'])
 note('model chain', routes.map((route) => route.provider + '/' + route.model).join(' → '))
 
 // ---------------------------------------------------------------- Slack (Web API only)
@@ -192,6 +196,25 @@ if (slack) {
     }
   } catch (error) {
     bad('Slack Web API', errText(error))
+  }
+}
+
+// ---------------------------------------------------------------- web search
+
+// One query to DeepSeek's Search API with the key the bot's web_search uses (the error text, which can
+// echo the key's last characters, is never printed).
+if (deepseekWeb && keyNames.includes('DEEPSEEK_API_KEY')) {
+  const key = readFileSync(opts['keys-file'], 'utf8').match(/^DEEPSEEK_API_KEY="?([^"\n]*)"?$/m)?.[1]
+  try {
+    const res = await fetch('https://api.deepseek.com/v1/tools/search', {
+      method: 'POST', headers: { authorization: 'Bearer ' + key, 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify({ query: 'DeepSeek', count: 1, need_content: false }), signal: AbortSignal.timeout(30000),
+    })
+    const body = await res.json().catch(() => ({}))
+    if (res.ok && Array.isArray(body.results)) ok('web search', 'DeepSeek Search API answered (' + body.results.length + ' result(s)) — web_search / web_fetch use it')
+    else bad('web search', 'DeepSeek Search API: HTTP ' + res.status + (typeof body.error?.type === 'string' ? ' ' + body.error.type : ''))
+  } catch (error) {
+    bad('web search', 'DeepSeek Search API: ' + errText(error))
   }
 }
 

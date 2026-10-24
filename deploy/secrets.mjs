@@ -6,8 +6,8 @@
 //                   → prints a one-line public key (dsk-pub1:…); the private key stays in <keyFile> (600)
 //   on the source:  node deploy/secrets.mjs seal <dsk-pub1:…> [--dsh-home ~/.dsh] [--keys NAME,NAME…]
 //                   → reads the Slack tokens from the slack-channel row of <dsh-home>/cordis.patch.yml and the
-//                     model API keys from the refs of <dsh-home>/.credentials.yaml (default keys: the ones the
-//                     Slack fallback chain uses), prints a one-line sealed blob (dsk-sealed1:…)
+//                     API keys from the refs of <dsh-home>/.credentials.yaml (default keys: the ones the Linux
+//                     kit's templates use), prints a one-line sealed blob (dsk-sealed1:…)
 //   on the target:  node deploy/secrets.mjs open <keyFile> <dsk-sealed1:…> --slack-out FILE --env-out FILE
 //                   → writes the Slack tokens as JSON to --slack-out and sets NAME="key" lines in --env-out
 //                     (DSH reads API keys from $DSH_HOME/.env), both 600, then deletes <keyFile>
@@ -23,8 +23,9 @@ import { dirname, join } from 'node:path'
 const PUB_PREFIX = 'dsk-pub1:'
 const SEALED_PREFIX = 'dsk-sealed1:'
 const INFO = Buffer.from('dsh-slack-channel secrets handoff v1')
-// Every provider in the Slack fallback chain: nvidia (primary + 2), opencode-go, deepseek-official.
-const DEFAULT_KEYS = ['NVIDIA_API_KEY', 'OPENCODE_GO_API_KEY', 'DEEPSEEK_API_KEY']
+// What deploy/linux/templates use: NVIDIA for every model of the Slack chain, DeepSeek's key for
+// web search/fetch only (the owner's choice for the Linux bot, 2026-10-25).
+const DEFAULT_KEYS = ['NVIDIA_API_KEY', 'DEEPSEEK_API_KEY']
 
 function die(message, code = 1) {
   process.stderr.write('error: ' + message + '\n')

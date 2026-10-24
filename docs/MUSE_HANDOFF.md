@@ -13,11 +13,14 @@ Mac の DSH はそのまま動かしておく。
   Mac の desktop プロファイルと同じバンドル（dsh-base + dsh-web-app + auto-review）を Node のサーバーとして動かす。
   GUI はなく、DSH 自身の Web サーバーは 127.0.0.1:4198 だけで待つ。
 - Slack チャンネルはこのリポジトリの `src/`（Mac で動いているものと同じコミット）。設定は Mac の `~/.dsh/cordis.patch.yml` の
-  slack-channel 行と同じ（モデルチェーン、`maxConcurrentTurns: 1`、`mentionRewrites`、surface ガード、チーム名簿）。
+  slack-channel 行と同じ（`maxConcurrentTurns: 1`、`mentionRewrites`、surface ガード、チーム名簿）。
+- **モデルは NVIDIA だけ（owner の決定、2026-10-25）:** GLM-5.3 → GLM-5.3-flash → DeepSeek-v4.1-flash（どれも NVIDIA）。
+  Mac のチェーンにある opencode-go と deepseek-official は VM では使わない。DeepSeek の API キーは Web 検索・取得
+  （`web_search` / `web_fetch` が使う DeepSeek の Search & Fetch API）のためだけに渡す。
 - すべて `~/.dsh-slack` の中: DSH のホーム（`DSH_HOME=~/.dsh-slack/home`。VM に `~/.dsh` があっても読まない・変えない）、
   共有エージェント設定（`DSH_AGENTS_HOME=~/.dsh-slack/agents`。Muse の `~/.agents` は読まない）、Node、dsh CLI、秘密、ログ。
 - エージェントの作業場所は `~/work`（`DSK_WORKDIR` で変更可）。
-- 秘密: Slack トークンは `~/.dsh-slack/secrets/slack.json`、モデルの API キー（NVIDIA / OpenCode Go / DeepSeek）は
+- 秘密: Slack トークンは `~/.dsh-slack/secrets/slack.json`、API キー（NVIDIA = モデル / DeepSeek = Web 検索）は
   `~/.dsh-slack/home/.env`（DSH が公式に読む場所）。どちらも 600。GitHub は VM の `gh auth token`（Muse の gh ログイン）を
   DSH 起動時に読む。Mac のトークンはコピーしない。
 - bash ツールのコマンドは Mac と同じ `permissionPreset: workspace-write` のサンドボックスの中で動く（作業場所と `/tmp` 以外は
@@ -85,8 +88,8 @@ node deploy/secrets.mjs seal 'dsk-pub1:…'
 Mac の DSH の設定ファイルから直接読む（値は画面に出ない）:
 
 - Slack トークン 2 つ: `~/.dsh/cordis.patch.yml` の slack-channel 行の `botToken` / `appToken`
-- モデルの API キー 3 つ: `~/.dsh/.credentials.yaml` の `refs` の `NVIDIA_API_KEY` / `OPENCODE_GO_API_KEY` / `DEEPSEEK_API_KEY`
-  （Slack のフォールバックチェーンが使うものだけ。ほかも渡すなら `--keys NAME,NAME…`）
+- API キー 2 つ: `~/.dsh/.credentials.yaml` の `refs` の `NVIDIA_API_KEY`（モデル）/ `DEEPSEEK_API_KEY`（Web 検索だけ）
+  （キットのテンプレートが使うものだけ。ほかも渡すなら `--keys NAME,NAME…`）
 
 GitHub のトークン（Mac の `~/.dsh/cordis.patch.yml` の MCP 行）は渡さない。VM では VM 自身の `gh auth token` を使う。
 
@@ -111,9 +114,10 @@ check の出力をそのまま返信してください（秘密の値は出ま�
 - `✓ Slack bot token — bot dsh (U0C9C7BNVB5) in azumaya`: 同じボットのトークンが入った。
 - `✓ Slack app token — Socket Mode URL issued (not connected)`: app トークンが有効。
 - `✓ Slack socket host — … reachable`: ソケットの接続先まで届く（ソケットは開かない）。
-- `✓ model API keys` と `· model chain`: キーの名前と、Slack のモデルチェーン。
-- `✓ model nvidia/… — answered OK in N s (dsh headless)`: VM の DSH がそのプロバイダのモデルを呼べた。既定はプロバイダごとに 1 つ
-  （NVIDIA / OpenCode Go / DeepSeek）。`check --all-routes` でチェーンの全モデル（主モデル GLM-5.3 は 1 回に数分かかる）。
+- `✓ API keys` と `· model chain`: キーの名前（NVIDIA_API_KEY, DEEPSEEK_API_KEY）と、Slack のモデルチェーン（NVIDIA だけ）。
+- `✓ web search — DeepSeek Search API answered`: Web 検索のキーとプロキシ経由の経路が通る（1 回だけ検索する）。
+- `✓ model nvidia/… — answered OK in N s (dsh headless)`: VM の DSH が NVIDIA のモデルを呼べた。既定は flash の 1 つ。
+  `check --all-routes` でチェーンの全モデル（主モデル GLM-5.3 は 1 回に数分かかる）。
 - `· GitHub CLI — logged in as …` と `✓ GitHub MCP token`: ボットはこのアカウントで GitHub を操作する。
 - `· git user.name — …`: ボットのコミットの名義。未設定なら
   `setup.sh git-identity "azumag" azumag@users.noreply.github.com`（`~/.gitconfig` は変えない）。

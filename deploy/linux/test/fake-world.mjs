@@ -6,8 +6,8 @@
 //
 //   WS_FROM=<a package.json whose node_modules has ws> FAKE_DIR=<cert dir> node fake-world.mjs
 //
-// The model answers "OK"; when a user message asks to "use bash", it first calls the bash tool
-// (echo tool-ok-$((6*7))) and then answers with what the tool printed.
+// The model answers "OK"; when a user message asks to "use bash" and to use "web_search", it first
+// calls bash (echo tool-ok-$((6*7))), then web_search, and answers with what the tools printed.
 
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
 import https from 'node:https'
@@ -57,17 +57,28 @@ async function slackApi(req, res, method) {
 
 const textOf = (content) => typeof content === 'string' ? content
   : Array.isArray(content) ? content.map((c) => c.type === 'tool_result' ? textOf(c.content) : c.text ?? '').join(' ') : ''
-const BASH_ARGS = { command: 'echo tool-ok-$((6*7))', description: 'container test' }
+const STEPS = [
+  { ask: /use bash/i, name: 'bash', input: { command: 'echo tool-ok-$((6*7))', description: 'container test' } },
+  { ask: /web_search/i, name: 'web_search', input: { queries: ['container test'] } },
+]
+/** Names of the tools the assistant already called (OpenAI tool_calls or Anthropic tool_use). */
+const called = (messages) => messages.filter((m) => m.role === 'assistant').flatMap((m) => [
+  ...(m.tool_calls ?? []).map((call) => call.function?.name),
+  ...(Array.isArray(m.content) ? m.content.filter((c) => c.type === 'tool_use').map((c) => c.name) : []),
+])
+const toolResults = (messages) => messages.filter((m) => m.role === 'tool' || (Array.isArray(m.content) && m.content.some((c) => c.type === 'tool_result')))
 
 /**
- * What the fake model says: after a tool result, what the tool printed; when a user message asks to
- * "use bash" and the bash tool is offered, a bash call; otherwise "OK".
+ * What the fake model says: each tool a user message asks for (bash: "use bash", then web_search:
+ * "web_search") and that is offered, once and in that order; then what the tools printed; otherwise "OK".
  */
 function decide(messages, tools) {
-  const toolResult = messages.findLast((m) => m.role === 'tool' || (Array.isArray(m.content) && m.content.some((c) => c.type === 'tool_result')))
-  if (toolResult) return { text: 'OK — the tool printed: ' + textOf(toolResult.content).trim().slice(0, 80) }
-  const asked = messages.some((m) => m.role === 'user' && /use bash/i.test(textOf(m.content)))
-  if (asked && tools.includes('bash')) return { tool: { id: 'call_fake_1', name: 'bash', input: BASH_ARGS } }
+  const asked = messages.filter((m) => m.role === 'user').map((m) => textOf(m.content)).join('\n')
+  const done = called(messages)
+  const next = STEPS.find((step) => step.ask.test(asked) && tools.includes(step.name) && !done.includes(step.name))
+  if (next) return { tool: { id: 'call_fake_' + next.name, name: next.name, input: next.input } }
+  const results = toolResults(messages)
+  if (results.length > 0) return { text: 'OK — the tools printed: ' + results.map((m) => textOf(m.content).replace(/\s+/g, ' ').trim().slice(0, 120)).join(' | ') }
   return { text: 'OK' }
 }
 
@@ -80,7 +91,7 @@ async function readModelRequest(req, host) {
   const keyMatches = req.headers.authorization === 'Bearer ' + key || req.headers['x-api-key'] === key
   const tools = Array.isArray(p.tools) ? p.tools.map((t) => t.function?.name ?? t.name) : []
   const decision = decide(messages, tools)
-  log({ host, path: req.url, keyMatches, model: p.model, stream: p.stream, tools: tools.length, hasBash: tools.includes('bash'), messages: messages.length, toolCall: Boolean(decision.tool) })
+  log({ host, path: req.url, keyMatches, model: p.model, stream: p.stream, tools: tools.length, hasBash: tools.includes('bash'), web: tools.filter((name) => /^web_/.test(name)), messages: messages.length, toolCall: Boolean(decision.tool) })
   return { p, keyMatches, decision }
 }
 
@@ -108,6 +119,16 @@ async function anthropic(req, res, host) {
   res.end()
 }
 
+/** DeepSeek's Search API (web_search): one result for a known key, 401 otherwise (like the real one). */
+async function deepseekSearch(req, res, host) {
+  let p = {}
+  try { p = JSON.parse(await body(req)) } catch { /* logged below */ }
+  const keyMatches = req.headers.authorization === 'Bearer ' + tokens.keys.DEEPSEEK_API_KEY
+  log({ host, path: req.url, keyMatches, query: p.query, count: p.count })
+  if (!keyMatches) return json(res, { error: { message: 'Authentication Fails, Your api key: ****fake is invalid', type: 'authentication_error' } }, 401)
+  json(res, { results: [{ url: 'https://example.com/', title: 'Example', snippet: 'fake result', date: null }] })
+}
+
 /** OpenAI chat completions (streamed or not): NVIDIA and OpenCode Go. */
 async function model(req, res, host) {
   const { p, keyMatches, decision } = await readModelRequest(req, host)
@@ -133,6 +154,7 @@ const server = https.createServer({ key: readFileSync(dir + '/server.key'), cert
   if (host === 'slack.com' && api) return void slackApi(req, res, api[1])
   if (MODEL_HOSTS[host] && req.method === 'POST' && /chat\/completions/.test(req.url)) return void model(req, res, host)
   if (MODEL_HOSTS[host] && req.method === 'POST' && /\/v1\/messages/.test(req.url)) return void anthropic(req, res, host)
+  if (host === 'api.deepseek.com' && req.method === 'POST' && req.url === '/v1/tools/search') return void deepseekSearch(req, res, host)
   if (MODEL_HOSTS[host] && req.method === 'GET' && /\/models/.test(req.url)) {
     log({ host, path: req.url, note: 'model list' })
     return json(res, { object: 'list', data: [] })
@@ -153,7 +175,7 @@ wss.on('connection', (socket, req) => {
   writeFileSync(sent, '1')
   setTimeout(() => {
     const ts = (Date.now() / 1000).toFixed(6)
-    const event = { type: 'message', channel: 'C0C8YJTC147', channel_type: 'channel', user: 'UHUMAN', text: '<@UFAKEDSH> container test: use bash to run one echo, then reply OK', ts, event_ts: ts, team: 'TFAKE' }
+    const event = { type: 'message', channel: 'C0C8YJTC147', channel_type: 'channel', user: 'UHUMAN', text: '<@UFAKEDSH> container test: use bash to run one echo, then one web_search, then reply OK', ts, event_ts: ts, team: 'TFAKE' }
     socket.send(JSON.stringify({
       envelope_id: 'env-fake-1', type: 'events_api', accepts_response_payload: false, retry_attempt: 0, retry_reason: '',
       payload: { token: 'x', team_id: 'TFAKE', api_app_id: 'AFAKE', type: 'event_callback', event_id: 'EvFAKE1', event_time: Math.floor(Date.now() / 1000), event, authorizations: [{ enterprise_id: null, team_id: 'TFAKE', user_id: 'UFAKEDSH', is_bot: true, is_enterprise_install: false }] },

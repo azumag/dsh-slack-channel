@@ -1,6 +1,7 @@
 # The Slack channel of the DSH Slack bot — a --patch overlay that only the service passes
 # (written by deploy/linux/setup.sh install; @…@ filled in). Mirrors the slack-channel row
-# of the Mac's ~/.dsh/cordis.patch.yml. The tokens are read from @SLACK_FILE@ (600,
+# of the Mac's ~/.dsh/cordis.patch.yml, except that the models are NVIDIA's only (the owner's
+# choice, 2026-10-25). The tokens are read from @SLACK_FILE@ (600,
 # written by `setup.sh import`) when DSH starts, so this file holds no secret.
 - insert:
     # DSH's log records → stdout → ~/.dsh-slack/logs/dsh.log (the CLI keeps them in memory only).
@@ -14,15 +15,14 @@
         appToken: !!js "JSON.parse(process.getBuiltinModule('node:fs').readFileSync('@SLACK_FILE@', 'utf8')).appToken"
         cwd: @WORKDIR@
         # Main model NVIDIA GLM-5.3; any failed model call (except a stop) retries the same turn
-        # down this chain, and the primary is tried again 2 min after a switch.
+        # down this chain, and the primary is tried again 2 min after a switch. NVIDIA only on this
+        # machine (the Mac's chain continues to opencode-go and deepseek-official).
         provider: nvidia
         model: z-ai/glm-5.3
         fallbackCooldownMs: 120000
         fallbacks:
           - { provider: nvidia, model: z-ai/glm-5.3-flash }
           - { provider: nvidia, model: deepseek-ai/deepseek-v4.1-flash }
-          - { provider: opencode-go, model: deepseek-v4.1-flash }
-          - { provider: deepseek-official, model: deepseek-flash }
         permissionPreset: workspace-write
         agentPreset: standard
         allowAllChannels: true

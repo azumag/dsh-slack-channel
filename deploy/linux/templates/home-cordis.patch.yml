@@ -1,62 +1,15 @@
 # Machine-local patch layer of the DSH Slack bot ($DSH_HOME/cordis.patch.yml, written by
 # deploy/linux/setup.sh install) — applies to every profile under this DSH_HOME, after the
-# profile's own cordis.patch.yml. Mirrors the Mac's ~/.dsh/profiles/desktop + ~/.dsh patches.
+# profile's own cordis.patch.yml. Based on the Mac's ~/.dsh/profiles/desktop + ~/.dsh patches.
 #
-# API keys are not here: DSH reads NVIDIA_API_KEY / OPENCODE_GO_API_KEY / DEEPSEEK_API_KEY from
-# $DSH_HOME/.env (written by `setup.sh import`).
+# Models are NVIDIA's only (the owner's choice, 2026-10-25). API keys are not here: DSH reads
+# NVIDIA_API_KEY (models) and DEEPSEEK_API_KEY (web search/fetch only) from $DSH_HOME/.env
+# (written by `setup.sh import`).
 
 - id: llm-pi-ai
   name: "@deepseek-ai/dsh-llm-pi-ai"
   config:
     providers:
-      opencode-go:
-        apiKeyEnv: OPENCODE_GO_API_KEY
-      opencode:
-        apiKeyEnv: OPENCODE_API_KEY
-      openrouter: {}
-      # Ids served by opencode.ai/zen/go that the bundled catalog does not describe yet.
-      opencode-go-new-completions:
-        displayName: OpenCode Go (chat completions, newer ids)
-        apiKeyEnv: OPENCODE_GO_API_KEY
-        api: openai-completions
-        baseURL: https://opencode.ai/zen/go/v1
-        headers:
-          x-opencode-session: dsh-uncatalogued
-        models:
-          - id: deepseek-flash
-            name: DeepSeek Flash
-          - id: minimax-m2.5
-            name: MiniMax-M2.5
-          - id: omen-alpha
-          - id: space-bunny
-          - id: cat-jam-free
-            name: Cat Jam (free)
-          - id: step-5-preview-free
-            name: Step-5 Preview (free)
-          - id: longcat-2.5-preview-free
-            name: LongCat 2.5 Preview (free)
-      opencode-go-new-responses:
-        displayName: OpenCode Go (responses, newer ids)
-        apiKeyEnv: OPENCODE_GO_API_KEY
-        api: openai-responses
-        baseURL: https://opencode.ai/zen/go/v1
-        headers:
-          x-opencode-session: dsh-uncatalogued
-        models:
-          - id: gpt-6-luna
-            name: GPT-6 Luna
-      opencode-go-new-anthropic:
-        displayName: OpenCode Go (anthropic messages, newer ids)
-        apiKeyEnv: OPENCODE_GO_API_KEY
-        api: anthropic-messages
-        baseURL: https://opencode.ai/zen/go
-        headers:
-          x-opencode-session: dsh-uncatalogued
-        models:
-          - id: claude-haiku-5-5
-            name: Claude Haiku 5.5
-      groq:
-        apiKeyEnv: GROQ_API_KEY
       nvidia:
         apiKeyEnv: NVIDIA_API_KEY
 
@@ -66,7 +19,8 @@
     provider: nvidia
     model: deepseek-ai/deepseek-v4.1-flash
 
-# DeepSeek's own Search & Fetch API (/v1/tools/search, /v1/tools/fetch) behind web_search / web_fetch.
+# DeepSeek's own Search & Fetch API (/v1/tools/search, /v1/tools/fetch) behind web_search / web_fetch —
+# the one use of DEEPSEEK_API_KEY here (no DeepSeek model is in the Slack chain).
 - id: web
   name: "@deepseek-ai/dsh-web"
   config:

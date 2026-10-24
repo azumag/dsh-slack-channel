@@ -152,7 +152,7 @@ $REPO/deploy/linux/setup.sh import "$sealed" > /dev/null 2>&1 && fail "second im
 [ "$(stat -c %a $DSK/secrets/slack.json)" = 600 ] && pass "slack.json 600" || fail "slack.json mode"
 [ "$(stat -c %a $DSK/home/.env)" = 600 ] && pass "keys .env 600" || fail "keys .env mode"
 grep -oE '^[A-Z_]+=' $DSK/home/.env | tr '\n' ' ' | sed 's/^/keys: /'; echo
-grep -q GROQ $DSK/home/.env && fail "a key outside the chain was carried" || pass "only the chain's keys carried"
+grep -qE 'GROQ|OPENCODE' $DSK/home/.env && fail "a key the kit does not use was carried" || pass "only NVIDIA_API_KEY + DEEPSEEK_API_KEY carried"
 leak_check /tmp/install.log /tmp/install2.log /tmp/import.log /tmp/seal.err /tmp/check0.log
 
 section "check (service env only)"
@@ -161,9 +161,11 @@ cat /tmp/check.log
 grep -q '✓ command sandbox — bwrap' /tmp/check.log && pass "check finds bwrap" || fail "check did not find bwrap"
 leak_check /tmp/check.log
 grep '"host":"integrate.api.nvidia.com"\|"host":"opencode.ai"\|"host":"api.deepseek.com"' $LOG | tail -n 4
-for h in integrate.api.nvidia.com opencode.ai api.deepseek.com; do
-  grep "\"host\":\"$h\"" $LOG | grep -q '"keyMatches":true' && pass "$h got its key through the proxy" || fail "$h: no request with the right key"
-done
+grep '"host":"integrate.api.nvidia.com"' $LOG | grep -q '"keyMatches":true' && pass "NVIDIA model call with its key through the proxy" || fail "NVIDIA: no request with the right key"
+grep '"host":"api.deepseek.com"' $LOG | grep '"path":"/v1/tools/search"' | grep -q '"keyMatches":true' && pass "DeepSeek Search API with its key through the proxy" || fail "DeepSeek Search API: no request with the right key"
+grep -q '"host":"opencode.ai"' $LOG && fail "check called OpenCode" || pass "no OpenCode call"
+grep '"host":"api.deepseek.com"' $LOG | grep -q 'messages' && fail "check called a DeepSeek model" || pass "no DeepSeek model call"
+grep -q '✓ web search' /tmp/check.log && pass "check: web search" || fail "check: no web search line"
 grep -q '"ws":"connected"' $LOG && fail "check opened the Slack socket" || pass "check did not open the Slack socket"
 
 section "net-refresh: a stale proxy copy in the env file"
@@ -201,11 +203,11 @@ leak_check /tmp/check-stale.log /tmp/check-refused.log /tmp/netrefresh0.log /tmp
 section "start needs --cutover"
 $REPO/deploy/linux/setup.sh start > /tmp/start0.log 2>&1 && fail "start without --cutover" || pass "start refuses without --cutover: $(head -c 90 /tmp/start0.log)"
 
-section "start --cutover → a mention is answered in its thread, after a bash tool call"
+section "start --cutover → a mention is answered in its thread, after a bash call and a web_search"
 $REPO/deploy/linux/setup.sh start --cutover | tee /tmp/start.log
 answered=""
 for _ in $(seq 1 90); do
-  answered="$(grep '"method":"chat.postMessage"' $LOG | grep 'tool printed' | tail -n 1)"
+  answered="$(grep '"method":"chat.postMessage"' $LOG | grep 'tools printed' | tail -n 1)"
   [ -n "$answered" ] && break
   sleep 2
 done
@@ -217,6 +219,10 @@ case "$answered" in
   *'"channel":"C0C8YJTC147"'*'"thread_ts":"'"$mention_ts"'"'*'tool-ok-42'*) pass "answered in the mention's thread with the bash tool's output" ;;
   *) fail "no answer with the tool output in the thread" ;;
 esac
+case "$answered" in *'example.com'*) pass "the answer carries the web_search result" ;; *) fail "no web_search result in the answer" ;; esac
+grep '"path":"/v1/tools/search"' $LOG | grep '"query":"container test"' | grep -q '"keyMatches":true' && pass "web_search went to DeepSeek's Search API with the key, through the proxy" || fail "web_search did not reach the Search API with the key"
+grep '"host":"integrate.api.nvidia.com"' $LOG | grep '"hasBash":true' | grep '"web":\[' | grep 'web_search' | grep -q 'web_fetch' && pass "the Slack agent has web_search + web_fetch" || fail "web tools missing from the Slack agent"
+grep -q '"host":"opencode.ai"' $LOG && fail "the bot called OpenCode" || pass "the bot called no OpenCode model"
 grep -q '"ws":"connected"' $LOG && pass "Socket Mode connected through the proxy" || fail "socket never connected"
 grep -q 'own identity resolved' /tmp/start.log && pass "start --cutover shows the channel's identity line" || fail "no identity line in start --cutover"
 grep -q 'INFO \[slack-channel\]' $DSK/logs/dsh.log && pass "DSH log records reach dsh.log" || fail "no DSH log records in dsh.log"
