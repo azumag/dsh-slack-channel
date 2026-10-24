@@ -241,6 +241,12 @@ Mac で最後まで処理して返信する（返信は Web API なので、ソ�
 - 3. の途中で戻すとき: VM で `setup.sh stop`、Mac で `rm ~/.dsh/slack-state.receive-off`（5 秒以内に Mac がまた受け付ける。
   再読み込みは起きない）。
 
+**実施記録（2026-10-25、owner の OK）:** 02:47:35 JST に Mac へ受付停止のコードを入れた（再読み込み 1 回。動いていたターン
+1 件はすぐ同じセッションで再開、待ち会話 28 件はそのまま待ち行列に戻った）。02:54:33 に VM が起動（Muse の報告:
+`own identity resolved (… user_id=U0C9C7BNVB5)`、`socket connected (num_connections=2)`、プロキシは /etc/environment のもの）。
+02:55:13 に Mac で `touch ~/.dsh/slack-state.receive-off` → 02:55:26 までに Mac の DSH から Slack（wss-primary）への接続が消え、
+drain.json は running 1 件・waiting 28 件。owner の判断で、28 件は時間がかかっても Mac で最後まで処理する。
+
 ### Mac: Slack チャンネルを止める
 
 Mac の DSH はデスクトップアプリのまま残し、Slack チャンネルだけ止める。`~/.dsh/cordis.patch.yml` の slack-channel 行の
