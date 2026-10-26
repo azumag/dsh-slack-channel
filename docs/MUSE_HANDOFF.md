@@ -311,6 +311,9 @@ VM の DSH は bash のコマンドを Landlock のサンドボックスで動�
 
 ### Mac: master に入れて push する（owner の OK の後）
 
+**2026-10-26 済み（owner「進めて」）:** `dd196ce..5205aa9` を早送りで master に push。Mac のチェックアウト（`~/work/dsh-slack-channel`）は
+dd196ce のまま（DSH ホストの dsh-hmr が `src/` を開いていて、無効な行のプラグインで再読み込みがどう動くかは未確認のため触っていない）。
+
 Mac の `~/work/dsh-slack-channel` では `src/` を書き換えない（Mac の DSH の dsh-hmr が見ている）。push はブランチをそのまま送るだけで、作業ツリーのファイルは変わらない:
 
 ```sh
@@ -327,9 +330,9 @@ DSH の Slack チャンネルが無効のまま・動いていないときに `g
 
 1. 更新（いつものプロキシの入ったシェルで）
    cd ~/dsh-slack-channel && git pull --ff-only && git log --oneline -1
-2. 再起動して状態を見る
+2. 再起動して、1 分ほど待ってから状態を見る（restart は再起動したことしか出しません）
    ~/dsh-slack-channel/deploy/linux/setup.sh restart
-   ~/dsh-slack-channel/deploy/linux/setup.sh status
+   sleep 60; ~/dsh-slack-channel/deploy/linux/setup.sh status
 
 返信してほしいもの: git log の 1 行 / restart と status の出力（status に socket connected が出ているか）。
 ```
