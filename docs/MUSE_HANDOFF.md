@@ -297,7 +297,7 @@ VM の DSH は bash のコマンドを Landlock のサンドボックスで動�
 
 - チャンネルが `tools/pre-execute` で各呼び出しの引数を覚え（エージェントごとに直近 32 件）、承認リクエストの呼び出し id で引く。
   bash ならコマンド（と `workdir`）、ほかのツールなら引数の JSON（`description` / `justification` は除く）。
-- `&` `<` `>` はほかの文字列と同じエスケープ（Slack はコードの中でも元の文字に戻して見せる）。コマンドの中の ```` ``` ```` は
+- `&` `<` `>` はほかの文字列と同じエスケープ（Slack の書式の決まりでは、コードの中でも元の文字に戻して見せる。本物での見た目は下の「未確認」）。コマンドの中の ```` ``` ```` は
   ブロックを閉じないよう崩す。表示は 2000 文字（エスケープ後）まで。切ったときは本当の長さを添える。
 - 秘密らしい値は Slack に出す前に伏せる（`src/redact.js`。`ghp_` `xoxb-` `nvapi-` `sk-` などの形、`*TOKEN*=` `--password`
   `Authorization:` の値、URL の `user:password@`、PEM の秘密鍵）。`$GH_TOKEN` のような参照はそのまま見せる。理由の行にも同じものをかける。
@@ -311,7 +311,7 @@ VM の DSH は bash のコマンドを Landlock のサンドボックスで動�
 
 ### Mac: master に入れて push する（owner の OK の後）
 
-Mac の `~/work/dsh-slack-channel` では `src/` を書き換えない（Mac の DSH の dsh-hmr が見ている）。push はワークツリーから:
+Mac の `~/work/dsh-slack-channel` では `src/` を書き換えない（Mac の DSH の dsh-hmr が見ている）。push はブランチをそのまま送るだけで、作業ツリーのファイルは変わらない:
 
 ```sh
 cd ~/work/dsh-slack-channel && git push origin approval-command:master
