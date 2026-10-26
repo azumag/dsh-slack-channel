@@ -6,8 +6,9 @@
 //
 //   WS_FROM=<a package.json whose node_modules has ws> FAKE_DIR=<cert dir> node fake-world.mjs
 //
-// The model answers "OK"; when a user message asks to "use bash" and to use "web_search", it first
-// calls bash (echo tool-ok-$((6*7))), then web_search, and answers with what the tools printed.
+// The model answers "OK"; when a user message asks to "escalate", to "use bash" and to use "web_search",
+// it first calls bash outside the sandbox (an approval prompt, which this fake Slack clicks Allow on),
+// then bash (echo tool-ok-$((6*7))), then web_search, and answers with what the tools printed.
 
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
 import https from 'node:https'
@@ -39,9 +40,14 @@ const json = (res, value, status = 200) => { res.writeHead(status, { 'content-ty
 async function slackApi(req, res, method) {
   const p = params(req, await body(req))
   const token = (req.headers.authorization ?? '').replace(/^Bearer /, '') || p.token
-  log({ host: 'slack.com', method, tokenMatches: token === tokens.bot ? 'bot' : token === tokens.app ? 'app' : 'no', channel: p.channel, thread_ts: p.thread_ts, text: p.markdown_text ?? p.text, name: p.name })
+  // An approval prompt: the section that shows the call, and the Allow button to click.
+  const blocks = Array.isArray(p.blocks) ? p.blocks : []
+  const approvalCall = blocks.find((block) => block?.block_id === 'dsh-approval-call')?.text?.text
+  const allow = blocks.flatMap((block) => block?.elements ?? []).find((element) => element?.action_id === 'dsh-slack-allow')
+  log({ host: 'slack.com', method, tokenMatches: token === tokens.bot ? 'bot' : token === tokens.app ? 'app' : 'no', channel: p.channel, thread_ts: p.thread_ts, text: p.markdown_text ?? p.text, name: p.name, approvalCall, approve: allow !== undefined || undefined })
   const known = token === tokens.bot || token === tokens.app
   if (!known) return json(res, { ok: false, error: 'invalid_auth' })
+  if (method === 'chat.postMessage' && allow !== undefined) setTimeout(() => clickAllow(p.channel, allow.value), 1500)
   switch (method) {
     case 'auth.test': return json(res, { ok: true, url: 'https://fake.slack.com/', ...BOT })
     case 'apps.connections.open':
@@ -58,13 +64,20 @@ async function slackApi(req, res, method) {
 const textOf = (content) => typeof content === 'string' ? content
   : Array.isArray(content) ? content.map((c) => c.type === 'tool_result' ? textOf(c.content) : c.text ?? '').join(' ') : ''
 const STEPS = [
-  { ask: /use bash/i, name: 'bash', input: { command: 'echo tool-ok-$((6*7))', description: 'container test' } },
-  { ask: /web_search/i, name: 'web_search', input: { queries: ['container test'] } },
+  // Outside the sandbox, so DSH asks for approval; the prompt must show this command with the key masked.
+  { ask: /escalate/i, name: 'bash', marker: 'approval-ok', input: {
+    command: 'GH_TOKEN=' + tokens.approvalSecret + " sh -c 'echo approval-ok-$((6*7))' 2>&1 < /dev/null",
+    description: 'container approval test',
+    sandbox_permissions: 'danger-full-access',
+    justification: 'container test: the approval prompt must show this command',
+  } },
+  { ask: /use bash/i, name: 'bash', marker: 'tool-ok-', input: { command: 'echo tool-ok-$((6*7))', description: 'container test' } },
+  { ask: /web_search/i, name: 'web_search', marker: 'container test', input: { queries: ['container test'] } },
 ]
-/** Names of the tools the assistant already called (OpenAI tool_calls or Anthropic tool_use). */
+/** The tool calls the assistant already made, as { name, args } (OpenAI tool_calls or Anthropic tool_use). */
 const called = (messages) => messages.filter((m) => m.role === 'assistant').flatMap((m) => [
-  ...(m.tool_calls ?? []).map((call) => call.function?.name),
-  ...(Array.isArray(m.content) ? m.content.filter((c) => c.type === 'tool_use').map((c) => c.name) : []),
+  ...(m.tool_calls ?? []).map((call) => ({ name: call.function?.name, args: String(call.function?.arguments ?? '') })),
+  ...(Array.isArray(m.content) ? m.content.filter((c) => c.type === 'tool_use').map((c) => ({ name: c.name, args: JSON.stringify(c.input ?? {}) })) : []),
 ])
 const toolResults = (messages) => messages.filter((m) => m.role === 'tool' || (Array.isArray(m.content) && m.content.some((c) => c.type === 'tool_result')))
 
@@ -75,8 +88,9 @@ const toolResults = (messages) => messages.filter((m) => m.role === 'tool' || (A
 function decide(messages, tools) {
   const asked = messages.filter((m) => m.role === 'user').map((m) => textOf(m.content)).join('\n')
   const done = called(messages)
-  const next = STEPS.find((step) => step.ask.test(asked) && tools.includes(step.name) && !done.includes(step.name))
-  if (next) return { tool: { id: 'call_fake_' + next.name, name: next.name, input: next.input } }
+  const next = STEPS.find((step) => step.ask.test(asked) && tools.includes(step.name)
+    && !done.some((call) => call.name === step.name && call.args.includes(step.marker)))
+  if (next) return { tool: { id: 'call_fake_' + next.marker.replace(/\W/g, '_'), name: next.name, input: next.input } }
   const results = toolResults(messages)
   if (results.length > 0) return { text: 'OK — the tools printed: ' + results.map((m) => textOf(m.content).replace(/\s+/g, ' ').trim().slice(0, 120)).join(' | ') }
   return { text: 'OK' }
@@ -167,7 +181,19 @@ const server = https.createServer({ key: readFileSync(dir + '/server.key'), cert
 // Socket Mode: hello, then (once per run) one channel mention for the bot.
 const sent = dir + '/event-sent'
 const wss = new WebSocketServer({ server, path: '/link/' })
+let live
+let clicks = 0
+/** A person clicks Allow on an approval prompt (a Block Kit click arrives over the socket). */
+function clickAllow(channel, value) {
+  clicks += 1
+  live?.send(JSON.stringify({
+    envelope_id: 'env-click-' + clicks, type: 'interactive', accepts_response_payload: false,
+    payload: { type: 'block_actions', team: { id: 'TFAKE' }, user: { id: 'UHUMAN' }, channel: { id: channel }, actions: [{ type: 'button', block_id: 'dsh-approval', action_id: 'dsh-slack-allow', value }] },
+  }))
+  log({ host: 'wss-primary.slack.com', ws: 'sent click', channel, live: live !== undefined })
+}
 wss.on('connection', (socket, req) => {
+  live = socket
   log({ host: 'wss-primary.slack.com', ws: 'connected', path: req.url })
   socket.send(JSON.stringify({ type: 'hello', num_connections: 1, debug_info: { host: 'fake', build_number: 1, approximate_connection_time: 18060 }, connection_info: { app_id: 'AFAKE' } }))
   socket.on('message', (data) => log({ host: 'wss-primary.slack.com', ws: 'client message', data: String(data).slice(0, 200) }))
@@ -175,7 +201,7 @@ wss.on('connection', (socket, req) => {
   writeFileSync(sent, '1')
   setTimeout(() => {
     const ts = (Date.now() / 1000).toFixed(6)
-    const event = { type: 'message', channel: 'C0C8YJTC147', channel_type: 'channel', user: 'UHUMAN', text: '<@UFAKEDSH> container test: use bash to run one echo, then one web_search, then reply OK', ts, event_ts: ts, team: 'TFAKE' }
+    const event = { type: 'message', channel: 'C0C8YJTC147', channel_type: 'channel', user: 'UHUMAN', text: '<@UFAKEDSH> container test: escalate one command, use bash to run one echo, then one web_search, then reply OK', ts, event_ts: ts, team: 'TFAKE' }
     socket.send(JSON.stringify({
       envelope_id: 'env-fake-1', type: 'events_api', accepts_response_payload: false, retry_attempt: 0, retry_reason: '',
       payload: { token: 'x', team_id: 'TFAKE', api_app_id: 'AFAKE', type: 'event_callback', event_id: 'EvFAKE1', event_time: Math.floor(Date.now() / 1000), event, authorizations: [{ enterprise_id: null, team_id: 'TFAKE', user_id: 'UFAKEDSH', is_bot: true, is_enterprise_install: false }] },

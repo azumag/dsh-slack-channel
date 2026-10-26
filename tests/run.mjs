@@ -11,6 +11,7 @@ for (const file of [
   'socket.spec.mjs',
   'sessions.spec.mjs',
   'surface.spec.mjs',
+  'redact.spec.mjs',
   'interactions.spec.mjs',
   'plugin.spec.mjs',
   'plugin-flow.spec.mjs',

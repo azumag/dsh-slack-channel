@@ -14,7 +14,8 @@
 // question reports the timeout to the model.
 
 import { randomUUID } from 'node:crypto'
-import { toSlackMrkdwn } from './format.js'
+import { escapeMrkdwn, toSlackMrkdwn } from './format.js'
+import { redactSecrets } from './redact.js'
 
 /**
  * Button action ids; handleInteractive routes on these strings. Slack refuses
@@ -47,6 +48,11 @@ const REASON_MAX = 1500
 const DETAIL_MAX = 800
 const OPTION_DESCRIPTION_MAX = 300
 const FALLBACK_TEXT_MAX = 400
+/** Rendered characters of the command an approval shows (its own section, under SECTION_TEXT_MAX). */
+const COMMAND_MAX = 2000
+const WORKDIR_MAX = 300
+/** Calls remembered per agent for approval prompts; an approval follows its call within the same step. */
+const CALLS_PER_AGENT = 32
 
 /** A promise that never settles, for "this racer has nothing to say yet". */
 const NEVER = new Promise(() => {})
@@ -67,6 +73,27 @@ function clip(value, max) {
 /** Backticks inside a code span would end it early; the tool name is ours. */
 function codeSpan(value) {
   return '`' + text(value).replace(/`/g, "'") + '`'
+}
+
+/**
+ * A fenced block of untrusted text, shown verbatim: & < > are escaped as
+ * everywhere else in mrkdwn (Slack decodes them inside code too, so `2>&1`
+ * reads as typed and `<!channel>` stays text), and a backtick run that could
+ * close the fence early is broken with zero-width spaces. Cut at `max`
+ * rendered characters without splitting an entity.
+ * @returns the block and whether the text was cut.
+ */
+function fencedBlock(value, max) {
+  const source = text(value).replaceAll('```', '`\u200b`\u200b`')
+  let body = ''
+  let used = 0
+  for (const char of source) {
+    const piece = char === '&' ? '&amp;' : char === '<' ? '&lt;' : char === '>' ? '&gt;' : char
+    if (body.length + piece.length > max) break
+    body += piece
+    used += char.length
+  }
+  return { block: '```\n' + body + '\n```', cut: used < source.length }
 }
 
 /** Render a duration the way a prompt reads it (30m, 45s, 1.5m). */
@@ -123,6 +150,41 @@ export function createInteractions({ config, logger, slack, sessions, authorized
 
   function threadOf(record) {
     return config.threadReplies === true ? record.threadTs : undefined
+  }
+
+  /**
+   * agent → (call id → the call's arguments). DSH's approval request names
+   * only the tool and the call id (`toolName`, `callId`, the model's
+   * `reason`), so the prompt could not say WHICH command it asks about; the
+   * plugin sees every call's arguments on `tools/pre-execute` first and keeps
+   * the latest few per owned agent here. Weak keys: a disposed agent's calls go
+   * with it.
+   */
+  const calls = new WeakMap()
+
+  /** Remember one call of an owned agent (the `tools/pre-execute` hook; never throws). */
+  function noteCall(exec) {
+    try {
+      const agent = exec?.agent
+      if (agent === null || typeof agent !== 'object' || typeof exec.callId !== 'string') return
+      if (ownedRecord(agent) === undefined) return
+      let known = calls.get(agent)
+      if (known === undefined) {
+        known = new Map()
+        calls.set(agent, known)
+      }
+      known.delete(exec.callId)
+      known.set(exec.callId, exec.arguments)
+      if (known.size > CALLS_PER_AGENT) known.delete(known.keys().next().value)
+    } catch (error) {
+      logger.warn('could not remember a tool call for approval prompts: ' + errorText(error))
+    }
+  }
+
+  /** The arguments of the call an approval asks about, or undefined when unknown. */
+  function callArguments(request) {
+    if (request.agent === null || typeof request.agent !== 'object' || typeof request.callId !== 'string') return undefined
+    return calls.get(request.agent)?.get(request.callId)
   }
 
   function track(entry) {
@@ -284,6 +346,7 @@ export function createInteractions({ config, logger, slack, sessions, authorized
       scope: record.key ?? String(record.chatId),
       threadTs: threadOf(record),
       request,
+      call: callArguments(request),
     })
     track(entry)
     armDeadline(entry, () => conclude(entry, { outcome: 'unavailable', expired: true }))
@@ -510,7 +573,7 @@ export function createInteractions({ config, logger, slack, sessions, authorized
 
   function promptText(entry) {
     if (entry.kind === 'approval') {
-      const reason = clip(entry.request.reason ?? entry.request.displayReason, FALLBACK_TEXT_MAX)
+      const reason = clip(redactSecrets(text(entry.request.reason ?? entry.request.displayReason)), FALLBACK_TEXT_MAX)
       return clip('Approval required: ' + text(entry.request.toolName) + (reason.length > 0 ? ' — ' + reason : ''), FALLBACK_TEXT_MAX)
     }
     return clip('Input needed: ' + entry.questions.map((question) => question.question).join(' / '), FALLBACK_TEXT_MAX)
@@ -523,10 +586,47 @@ export function createInteractions({ config, logger, slack, sessions, authorized
 
   function approvalSection(entry) {
     const lines = [':lock: *Approval required* — ' + codeSpan(entry.request.toolName)]
-    const reason = clip(entry.request.reason ?? entry.request.displayReason, REASON_MAX)
+    const reason = clip(redactSecrets(text(entry.request.reason ?? entry.request.displayReason)), REASON_MAX)
     if (reason.trim().length > 0) lines.push(escape(reason))
     lines.push(approvalFooter())
     return clip(lines.join('\n\n'), SECTION_TEXT_MAX)
+  }
+
+  /**
+   * What the approval is about: a command tool's command (and its working
+   * directory), any other tool's arguments as JSON — secret-looking values
+   * masked, the model's restatements (`description`, `justification`) left
+   * to the reason line. Undefined when there is nothing to show: a request
+   * without a call id, or a call with no arguments worth showing.
+   */
+  function callSection(entry) {
+    if (typeof entry.request.callId !== 'string') return undefined
+    const args = entry.call
+    const lines = []
+    if (args === null || typeof args !== 'object') {
+      lines.push('_The call\'s arguments were not seen by this channel, so the command cannot be shown — check the DSH session before allowing._')
+    } else {
+      let label
+      let shown
+      if (typeof args.command === 'string') {
+        label = '*Command*'
+        shown = args.command
+        if (typeof args.workdir === 'string' && args.workdir.length > 0) {
+          label += ' in `' + escapeMrkdwn(clip(redactSecrets(args.workdir), WORKDIR_MAX)).replace(/`/g, "'") + '`'
+        }
+      } else {
+        const { description: _description, justification: _justification, ...rest } = args
+        if (Object.keys(rest).length === 0) return undefined
+        label = '*Arguments*'
+        shown = JSON.stringify(rest, null, 2)
+      }
+      const fenced = fencedBlock(redactSecrets(shown), COMMAND_MAX)
+      lines.push(label, fenced.block)
+      if (fenced.cut) {
+        lines.push('_Cut here: the full text is ' + shown.length + ' characters — read the rest in the DSH session before allowing._')
+      }
+    }
+    return { type: 'section', block_id: 'dsh-approval-call', text: { type: 'mrkdwn', text: lines.join('\n') } }
   }
 
   function approvalButtons(entry) {
@@ -623,7 +723,10 @@ export function createInteractions({ config, logger, slack, sessions, authorized
   }
 
   function promptBlocks(entry) {
-    if (entry.kind === 'approval') return [{ type: 'section', text: { type: 'mrkdwn', text: approvalSection(entry) } }, approvalButtons(entry)]
+    if (entry.kind === 'approval') {
+      const call = callSection(entry)
+      return [{ type: 'section', text: { type: 'mrkdwn', text: approvalSection(entry) } }, ...(call === undefined ? [] : [call]), approvalButtons(entry)]
+    }
     const blocks = [{
       type: 'section',
       text: { type: 'mrkdwn', text: ':question: *Input needed* — ' + entry.questions.length + ' question(s)' },
@@ -649,7 +752,7 @@ export function createInteractions({ config, logger, slack, sessions, authorized
     const lines = []
     if (entry.kind === 'approval') {
       lines.push(':lock: *Approval — ' + codeSpan(entry.request.toolName) + '*')
-      const reason = clip(entry.request.reason ?? entry.request.displayReason, REASON_MAX)
+      const reason = clip(redactSecrets(text(entry.request.reason ?? entry.request.displayReason)), REASON_MAX)
       if (reason.trim().length > 0) lines.push(escape(reason))
       if (decision.outcome === 'allowed-once') lines.push('✅ *Allowed once*' + actorSuffix(decision) + (decision.downstream === true ? ' (answered in the DSH UI)' : ''))
       else if (decision.outcome === 'rejected') lines.push('⛔ *Denied*' + actorSuffix(decision) + (decision.downstream === true ? ' (answered in the DSH UI)' : ''))
@@ -668,7 +771,11 @@ export function createInteractions({ config, logger, slack, sessions, authorized
       else if (decision.postFailed === true) lines.push('⚠️ *Not asked here* — the prompt could not be posted.')
       else lines.push('⌛ *Expired* — no answer within ' + humanDuration(timeoutMs) + '.')
     }
-    return [{ type: 'section', text: { type: 'mrkdwn', text: clip(lines.join('\n\n'), SECTION_TEXT_MAX) } }]
+    const blocks = [{ type: 'section', text: { type: 'mrkdwn', text: clip(lines.join('\n\n'), SECTION_TEXT_MAX) } }]
+    // The settled message keeps the command, so the thread records what was allowed.
+    const call = entry.kind === 'approval' ? callSection(entry) : undefined
+    if (call !== undefined) blocks.push(call)
+    return blocks
   }
 
   function settledText(entry, decision) {
@@ -703,6 +810,7 @@ export function createInteractions({ config, logger, slack, sessions, authorized
   return {
     answerApproval,
     answerQuestion,
+    noteCall,
     handleInteractive,
     answerFromText,
     hasPending,

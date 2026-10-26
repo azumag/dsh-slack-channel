@@ -357,3 +357,25 @@ test('the prompt is escaped like a reply, not rendered as markdown', async () =>
     await mock.close()
   }
 })
+
+test('the prompt shows the command its call carried on tools/pre-execute', async () => {
+  const mock = await startMockSlack()
+  try {
+    const h = await mount(mock)
+    const agent = await startSession(h)
+    const exec = { agent, callId: 'call_00_fake', name: 'bash', arguments: { command: 'hermes cron --help 2>&1 | head -40', description: 'Show hermes cron commands' } }
+    const gate = await h.waterfall('tools/pre-execute', exec, () => Promise.resolve({ kind: 'ask', reason: 'policy' }))
+    equal(gate, { kind: 'ask', reason: 'policy' }, 'the gate decision passes through untouched')
+    const outcome = h.waterfall('approval/request', { agent, toolName: 'bash', callId: 'call_00_fake', reason: 'escalate sandbox to danger-full-access: read-only' }, NEVER)
+    const prompt = await waitFor(() => h.sent().find((body) => Array.isArray(body.blocks)))
+    const shown = prompt.blocks.find((block) => block.block_id === 'dsh-approval-call')?.text.text ?? ''
+    assert(shown.includes('```\nhermes cron --help 2&gt;&amp;1 | head -40\n```'), 'the command reaches Slack: ' + shown)
+    h.push(messageEvent('C42', '!deny', { ts: '1700000009.001' }))
+    equal(await outcome, 'rejected')
+    await sleep(20)
+    await h.dispose()
+    equal(h.listeners['tools/pre-execute']?.length ?? 0, 0, 'teardown removes the hook')
+  } finally {
+    await mock.close()
+  }
+})

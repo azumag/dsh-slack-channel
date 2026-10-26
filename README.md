@@ -326,11 +326,13 @@ One line per message (newlines shown as `⏎`, 1500 characters at most), oldest 
 
 A channel session is a real DSH session, so it can stop and ask — for a permission (**run this command that needs to leave the sandbox?**) or for input (`ask_user_question`). Without help those prompts only exist in a DSH client that has the session open, which a Slack-driven session usually does not: the turn stays open, the channel's busy flag stays set, and every later message queues with no answer ever coming. The plugin answers both seams for the sessions it owns:
 
-- **Approval** — posted in the turn's thread with **Allow once** and **Deny** buttons, the tool name, and the reason the tool gave. The click closes the request (`allowed-once` / `rejected`); `!allow` / `!deny` do the same from the keyboard.
+- **Approval** — posted in the turn's thread with **Allow once** and **Deny** buttons, the tool name, the reason the tool gave, and **the call itself**: a command tool's command (with its working directory) or any other tool's arguments as JSON, in a code block. The click closes the request (`allowed-once` / `rejected`); `!allow` / `!deny` do the same from the keyboard.
 - **`ask_user_question`** — posted with one button per option (per question, in a batch). A **multi-select** question toggles and commits with **Submit selection**. A free-form question — one with no options to click — is answered by a plain channel message; `!answer <text>` answers any question in your own words (the "Other" path).
 - **Settled prompts are rewritten in place**: the buttons are removed and the message shows who decided and what. A click on an already-settled prompt does nothing.
 
 The prompt is escaped exactly like a reply, so the tool's reason cannot smuggle a link or a `@channel` into the channel. The buttons carry an opaque prompt id, and a click from a channel that is not authorized is ignored.
+
+DSH's approval request names the call only by id (`toolName`, `callId`, the model's `reason`), so the plugin remembers each call's arguments on `tools/pre-execute` (the latest 32 per channel agent) and shows the one the request names. The command is shown as written — `&`, `<`, `>` escaped, a ```` ``` ```` inside it broken so it cannot end the block — cut at 2000 rendered characters with a note saying how long it really is, and with secret-looking values masked before it reaches Slack (`src/redact.js`: known key shapes such as `xoxb-`, `ghp_`, `nvapi-`, `sk-`, JWTs; values of secret-named variables, JSON keys, flags and `Authorization` headers; `user:password@` in URLs; PEM private keys — best effort, references such as `$GH_TOKEN` stay readable). The settled message keeps the command, so the thread records what was allowed. A call the plugin did not see (one raised before a reload, say) is said so instead of left out.
 
 **Nothing waits forever.** A prompt that nobody answers is settled at `interactiveTimeoutMs` (30 minutes by default): an approval fails closed (`unavailable` — the operation is *not* approved), a question returns a timeout error to the model, and either way the turn finishes and the channel takes work again. Set a smaller value to fail fast in unattended channels, or `0` to wait until you `!stop` the turn.
 
@@ -394,7 +396,8 @@ src/schema.js           Standard Schema v1 config validator (inline, no deps)
 src/slack.js            Web API client: call / openConnections / postMessage / updateMessage / reactions, splitMessage
 src/socket.js           Socket Mode loop: fresh-URL reconnect, envelope acks, event + interactive routing
 src/handover.js         receive-off and drain files (moving the bot to another host without stopping its turns)
-src/interactions.js     Slack-side answering for approval/request and user-questions/request (buttons, deadline)
+src/interactions.js     Slack-side answering for approval/request and user-questions/request (buttons, deadline, the call's command)
+src/redact.js           masking of secret-looking values in what an approval prompt shows
 src/format.js           markdown → Slack mrkdwn (escaped angle brackets, allowlisted mentions restored, fences preserved)
 src/message.js          frozen user-message factory (dsh-llm createUserMessage shape)
 src/collector.js        per-turn reply collector (last/all)

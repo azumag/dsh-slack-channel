@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Runs inside the test container (see run.sh) as root with HOME=/home/hatch, like Muse's VM:
-# clone → install → keygen → seal/import → check → start --cutover → one Slack mention answered (with a
-# bash tool call) → restart → stop. Slack, the model APIs and GitHub's MCP host are fakes
-# (fake-world.mjs); nothing real is touched.
+# clone → install → keygen → seal/import → check → start --cutover → one Slack mention answered (with an
+# approval prompt for a bash call outside the sandbox, clicked Allow, then a bash tool call) → restart → stop.
+# Slack, the model APIs and GitHub's MCP host are fakes (fake-world.mjs); nothing real is touched.
 set -uo pipefail
 
 export HOME=/home/hatch
@@ -69,8 +69,10 @@ openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 
 rand() { head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24; }
 BOT_TOKEN="xoxb-111-222-$(rand)"; APP_TOKEN="xapp-1-A111-333-$(rand)"
 NV_KEY="nvapi-fake-$(rand)"; GO_KEY="oc_sk_fake$(rand)"; DS_KEY="sk-fake$(rand)"; GH_FAKE="gho_fake$(rand)"
-printf '{"bot":"%s","app":"%s","keys":{"NVIDIA_API_KEY":"%s","OPENCODE_GO_API_KEY":"%s","DEEPSEEK_API_KEY":"%s"}}\n' \
-  "$BOT_TOKEN" "$APP_TOKEN" "$NV_KEY" "$GO_KEY" "$DS_KEY" > tokens.json
+# The key the fake model puts inline in the command it asks approval for; the prompt must mask it.
+APPROVAL_SECRET="ghp_$(rand)"
+printf '{"bot":"%s","app":"%s","approvalSecret":"%s","keys":{"NVIDIA_API_KEY":"%s","OPENCODE_GO_API_KEY":"%s","DEEPSEEK_API_KEY":"%s"}}\n' \
+  "$BOT_TOKEN" "$APP_TOKEN" "$APPROVAL_SECRET" "$NV_KEY" "$GO_KEY" "$DS_KEY" > tokens.json
 chmod 600 tokens.json
 # Stand-in for the VM's `gh` (logged in as azumag there): enough for check and the MCP header.
 cat > /usr/local/bin/gh <<EOF
@@ -216,7 +218,7 @@ leak_check /tmp/check-stale.log /tmp/check-refused.log /tmp/netrefresh0.log /tmp
 section "start needs --cutover"
 $REPO/deploy/linux/setup.sh start > /tmp/start0.log 2>&1 && fail "start without --cutover" || pass "start refuses without --cutover: $(head -c 90 /tmp/start0.log)"
 
-section "start --cutover → a mention is answered in its thread, after a bash call and a web_search"
+section "start --cutover → a mention is answered in its thread, after an approved bash call, a bash call and a web_search"
 $REPO/deploy/linux/setup.sh start --cutover | tee /tmp/start.log
 answered=""
 for _ in $(seq 1 90); do
@@ -240,6 +242,22 @@ grep -q '"ws":"connected"' $LOG && pass "Socket Mode connected through the proxy
 grep -q 'own identity resolved' /tmp/start.log && pass "start --cutover shows the channel's identity line" || fail "no identity line in start --cutover"
 grep -q 'INFO \[slack-channel\]' $DSK/logs/dsh.log && pass "DSH log records reach dsh.log" || fail "no DSH log records in dsh.log"
 grep '"host":"integrate.api.nvidia.com"' $LOG | grep '"hasBash":true' | tail -n 2
+
+section "the approval prompt shows the command it asks about (key masked), and the click allows it"
+prompt="$(grep '"method":"chat.postMessage"' $LOG | grep '"approve":true' | tail -n 1)"
+echo "approval prompt: $prompt"
+[ -n "$prompt" ] && pass "an approval prompt was posted in the mention's thread" || fail "no approval prompt was posted"
+case "$prompt" in *'"thread_ts":"'"$mention_ts"'"'*) pass "the prompt is in the mention's thread" ;; *) fail "the prompt is not in the mention's thread" ;; esac
+shown="GH_TOKEN=ghp_&lt;redacted&gt; sh -c 'echo approval-ok-\$((6*7))' 2&gt;&amp;1 &lt; /dev/null"
+printf '%s' "$prompt" | grep -qF "$shown" && pass "the prompt shows the command, escaped, the key masked" || fail "the prompt does not show the command as expected: $shown"
+printf '%s' "$prompt" | grep -qF '"approvalCall":"*Command*\n```\n' && pass "the command is a code block" || fail "the command is not a code block"
+grep -qF "$APPROVAL_SECRET" $LOG && fail "the inline key reached Slack" || pass "the inline key reached no Slack call"
+grep -q '"ws":"sent click"' $LOG && pass "Allow was clicked over the socket" || fail "no click was sent"
+settled="$(grep '"method":"chat.update"' $LOG | grep 'Approval: allowed once' | tail -n 1)"
+echo "settled prompt: $settled"
+printf '%s' "$settled" | grep -qF "$shown" && pass "the settled prompt says allowed once and keeps the command" || fail "the settled prompt lost the command or the decision"
+case "$answered" in *'approval-ok-42'*) pass "the approved command ran outside the sandbox" ;; *) fail "the approved command's output is not in the answer" ;; esac
+
 grep -E 'CONNECT' /var/log/tinyproxy/tinyproxy.log | grep -oE '[a-z0-9.-]+:443' | sort | uniq -c
 $REPO/deploy/linux/setup.sh logs 40 | cut -c1-240
 $REPO/deploy/linux/setup.sh status

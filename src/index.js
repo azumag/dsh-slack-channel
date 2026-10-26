@@ -681,6 +681,13 @@ export function apply(ctx, config) {
   // Foreign agents (subagents, web sessions) are delegated untouched inside.
   const offApproval = ctx.on('approval/request', (request, next) => interactions.answerApproval(request, next), { prepend: true })
   const offQuestions = ctx.on('user-questions/request', (request, next) => interactions.answerQuestion(request, next), { prepend: true })
+  // An approval request carries the call id but not the arguments, so the
+  // prompt learns the command here, on the way in. Prepended so no listener
+  // that answers the gate itself (an `ask`, a deny) can skip past it.
+  const offCalls = ctx.on('tools/pre-execute', (exec, next) => {
+    interactions.noteCall(exec)
+    return next()
+  }, { prepend: true })
 
   /**
    * Handle one Slack message event. Only `message` events are accepted —
@@ -982,6 +989,7 @@ export function apply(ctx, config) {
     if (typeof offError === 'function') offError()
     if (typeof offApproval === 'function') offApproval()
     if (typeof offQuestions === 'function') offQuestions()
+    if (typeof offCalls === 'function') offCalls()
     // Settle every prompt still waiting: the sessions are about to go, and a
     // prompt that outlived them would hold the approval/question call forever.
     interactions.disposeAll()

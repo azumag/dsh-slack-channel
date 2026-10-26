@@ -506,3 +506,126 @@ test('a click carrying the bare option action id still answers', async () => {
   await h.interactions.handleInteractive(click('C42', ACTION_QUESTION_OPTION, no.value))
   equal((await pending).answers, [{ id: 'a', selected: ['No'] }])
 })
+
+// ── the call an approval asks about ─────────────────────────────────────
+
+/** The section that shows the call, or undefined. */
+function callSectionText(blocks) {
+  return blocks.find((block) => block.block_id === 'dsh-approval-call')?.text.text
+}
+
+/** One bash call as tools/pre-execute hands it over. */
+function bashCall(agent, callId, args) {
+  return { agent, callId, name: 'bash', arguments: { description: 'model summary', ...args } }
+}
+
+test('approval: the prompt shows the command of the call it asks about, escaped', async () => {
+  const h = mount()
+  const { agent, record } = owned()
+  h.records.set(agent.session.id, record)
+  h.interactions.noteCall(bashCall(agent, 'call_1', {
+    command: 'cat <<EOF > /tmp/x && echo "a & b" 2>&1 <!channel>',
+    workdir: '/srv/app',
+    sandbox_permissions: 'danger-full-access',
+    justification: 'read-only check',
+  }))
+  const pending = h.interactions.answerApproval({ agent, toolName: 'bash', callId: 'call_1', reason: 'escalate sandbox to danger-full-access: read-only check' }, NEVER)
+  await waitFor(() => h.posts().length === 1)
+  const blocks = h.posts()[0].options.blocks
+  equal(blocks.map((block) => block.type), ['section', 'section', 'actions'], 'reason, command, buttons')
+  const shown = callSectionText(blocks)
+  assert(shown.includes('```\ncat &lt;&lt;EOF &gt; /tmp/x &amp;&amp; echo "a &amp; b" 2&gt;&amp;1 &lt;!channel&gt;\n```'), 'the command is a code block, escaped: ' + shown)
+  assert(shown.includes('*Command* in `/srv/app`'), 'the working directory is named: ' + shown)
+  assert(shown.includes('model summary') === false, 'the model\'s description is not shown as the command')
+  equal(blockKitViolation(blocks), undefined, 'Slack would accept the prompt')
+
+  const allow = button(blocks, ACTION_APPROVAL_ALLOW)
+  await h.interactions.handleInteractive(click('C42', ACTION_APPROVAL_ALLOW, allow.value))
+  equal(await pending, 'allowed-once')
+  await waitFor(() => h.updates().length === 1)
+  const settled = h.updates()[0].options.blocks
+  assert(settled[0].text.text.includes('Allowed once'), 'the decision stays in the first section')
+  equal(callSectionText(settled), shown, 'the settled message keeps the command it allowed')
+})
+
+test('approval: secrets in the command are masked and a fence cannot be closed early', async () => {
+  const h = mount()
+  const { agent, record } = owned()
+  h.records.set(agent.session.id, record)
+  const token = 'gh' + 'p_' + 'AbCdEfGhIjKlMnOpQrStUvWxYz0123456789'
+  h.interactions.noteCall(bashCall(agent, 'call_2', { command: 'GH_TOKEN=' + token + ' gh api user\necho ```done```' }))
+  const pending = h.interactions.answerApproval({ agent, toolName: 'bash', callId: 'call_2', reason: 'uses ' + token }, NEVER)
+  await waitFor(() => h.posts().length === 1)
+  const post = h.posts()[0]
+  const everything = JSON.stringify(post)
+  equal(everything.includes(token), false, 'the token is nowhere in the post')
+  const shown = callSectionText(post.options.blocks)
+  assert(shown.includes('GH_TOKEN=ghp_&lt;redacted&gt; gh api user'), 'the masked token keeps its prefix: ' + shown)
+  equal(shown.split('```').length - 1, 2, 'only the block\'s own fences: ' + shown)
+  h.interactions.answerFromText('C42', 'deny', '', 'U1')
+  equal(await pending, 'rejected')
+})
+
+test('approval: a long command is cut inside its own section, with a note', async () => {
+  const h = mount()
+  const { agent, record } = owned()
+  h.records.set(agent.session.id, record)
+  h.interactions.noteCall(bashCall(agent, 'call_3', { command: 'echo ' + '&'.repeat(5000) }))
+  const pending = h.interactions.answerApproval({ agent, toolName: 'bash', callId: 'call_3', reason: 'r'.repeat(3000) }, NEVER)
+  await waitFor(() => h.posts().length === 1)
+  const blocks = h.posts()[0].options.blocks
+  const shown = callSectionText(blocks)
+  assert(shown.length <= 3000, 'within Slack\'s section limit: ' + shown.length)
+  assert(/(&amp;)+\n```/.test(shown), 'no entity is split at the cut')
+  assert(shown.includes('the full text is 5005 characters'), 'the cut is said: ' + shown.slice(-200))
+  assert(blocks[0].text.text.length <= 3000, 'the reason section keeps its own limit')
+  h.interactions.answerFromText('C42', 'deny', '', 'U1')
+  await pending
+})
+
+test('approval: a call the channel did not see is said so; no call id shows nothing more', async () => {
+  const h = mount()
+  const { agent, record } = owned()
+  // Seen before the agent was the channel's: not remembered.
+  h.interactions.noteCall(bashCall(agent, 'call_4', { command: 'rm -rf /tmp/x' }))
+  h.records.set(agent.session.id, record)
+  const unseen = h.interactions.answerApproval({ agent, toolName: 'bash', callId: 'call_4' }, NEVER)
+  await waitFor(() => h.posts().length === 1)
+  const shown = callSectionText(h.posts()[0].options.blocks)
+  assert(shown !== undefined && shown.includes('cannot be shown'), 'the prompt says the command is unknown: ' + shown)
+  assert(shown.includes('rm -rf') === false, 'a foreign agent\'s call was not kept')
+  h.interactions.answerFromText('C42', 'deny', '', 'U1')
+  await unseen
+
+  const bare = h.interactions.answerApproval({ agent, toolName: 'bash' }, NEVER)
+  await waitFor(() => h.posts().length === 2)
+  equal(h.posts()[1].options.blocks.map((block) => block.type), ['section', 'actions'], 'no call section without a call id')
+  h.interactions.answerFromText('C42', 'deny', '', 'U1')
+  await bare
+})
+
+test('approval: other tools show their arguments as JSON; old calls are forgotten', async () => {
+  const h = mount()
+  const { agent, record } = owned()
+  h.records.set(agent.session.id, record)
+  h.interactions.noteCall({ agent, callId: 'w1', name: 'write', arguments: { path: '/etc/hosts', content: '127.0.0.1 x', description: 'd' } })
+  const write = h.interactions.answerApproval({ agent, toolName: 'write', callId: 'w1' }, NEVER)
+  await waitFor(() => h.posts().length === 1)
+  const shown = callSectionText(h.posts()[0].options.blocks)
+  assert(shown.startsWith('*Arguments*') && shown.includes('"path": "/etc/hosts"'), 'the arguments are shown: ' + shown)
+  assert(shown.includes('description') === false, 'without the model\'s restatement')
+  h.interactions.answerFromText('C42', 'deny', '', 'U1')
+  await write
+
+  for (let i = 0; i < 40; i++) h.interactions.noteCall(bashCall(agent, 'many-' + i, { command: 'echo ' + i }))
+  const oldest = h.interactions.answerApproval({ agent, toolName: 'bash', callId: 'many-0' }, NEVER)
+  await waitFor(() => h.posts().length === 2)
+  assert(callSectionText(h.posts()[1].options.blocks).includes('cannot be shown'), 'the oldest call is gone')
+  h.interactions.answerFromText('C42', 'deny', '', 'U1')
+  await oldest
+  const newest = h.interactions.answerApproval({ agent, toolName: 'bash', callId: 'many-39' }, NEVER)
+  await waitFor(() => h.posts().length === 3)
+  assert(callSectionText(h.posts()[2].options.blocks).includes('echo 39'), 'the newest is kept')
+  h.interactions.answerFromText('C42', 'deny', '', 'U1')
+  await newest
+})
