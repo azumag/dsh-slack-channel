@@ -14,7 +14,7 @@
 // question reports the timeout to the model.
 
 import { randomUUID } from 'node:crypto'
-import { escapeMrkdwn, toSlackMrkdwn } from './format.js'
+import { toSlackMrkdwn } from './format.js'
 import { redactSecrets } from './redact.js'
 
 /**
@@ -75,25 +75,29 @@ function codeSpan(value) {
   return '`' + text(value).replace(/`/g, "'") + '`'
 }
 
-/**
- * A fenced block of untrusted text, shown verbatim: & < > are escaped as
- * everywhere else in mrkdwn (Slack decodes them inside code too, so `2>&1`
- * reads as typed and `<!channel>` stays text), and a backtick run that could
- * close the fence early is broken with zero-width spaces. Cut at `max`
- * rendered characters without splitting an entity.
- * @returns the block and whether the text was cut.
- */
-function fencedBlock(value, max) {
-  const source = text(value).replaceAll('```', '`\u200b`\u200b`')
+/** Escape & < > and cut at `max` rendered characters without splitting an entity. */
+function escapeClip(value, max) {
   let body = ''
   let used = 0
-  for (const char of source) {
+  for (const char of value) {
     const piece = char === '&' ? '&amp;' : char === '<' ? '&lt;' : char === '>' ? '&gt;' : char
     if (body.length + piece.length > max) break
     body += piece
     used += char.length
   }
-  return { block: '```\n' + body + '\n```', cut: used < source.length }
+  return { body, cut: used < value.length }
+}
+
+/**
+ * A fenced block of untrusted text, shown verbatim: & < > are escaped as
+ * everywhere else in mrkdwn (Slack decodes them inside code too, so `2>&1`
+ * reads as typed and `<!channel>` stays text), and a backtick run that could
+ * close the fence early is broken with zero-width spaces.
+ * @returns the block and whether the text was cut.
+ */
+function fencedBlock(value, max) {
+  const { body, cut } = escapeClip(text(value).replaceAll('```', '`\u200b`\u200b`'), max)
+  return { block: '```\n' + body + '\n```', cut }
 }
 
 /** Render a duration the way a prompt reads it (30m, 45s, 1.5m). */
@@ -612,7 +616,8 @@ export function createInteractions({ config, logger, slack, sessions, authorized
         label = '*Command*'
         shown = args.command
         if (typeof args.workdir === 'string' && args.workdir.length > 0) {
-          label += ' in `' + escapeMrkdwn(clip(redactSecrets(args.workdir), WORKDIR_MAX)).replace(/`/g, "'") + '`'
+          const dir = escapeClip(redactSecrets(args.workdir).replace(/`/g, "'"), WORKDIR_MAX)
+          label += ' in `' + dir.body + (dir.cut ? '…' : '') + '`'
         }
       } else {
         const { description: _description, justification: _justification, ...rest } = args

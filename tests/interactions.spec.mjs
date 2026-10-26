@@ -570,7 +570,7 @@ test('approval: a long command is cut inside its own section, with a note', asyn
   const h = mount()
   const { agent, record } = owned()
   h.records.set(agent.session.id, record)
-  h.interactions.noteCall(bashCall(agent, 'call_3', { command: 'echo ' + '&'.repeat(5000) }))
+  h.interactions.noteCall(bashCall(agent, 'call_3', { command: 'echo ' + '&'.repeat(5000), workdir: '/srv/' + '&'.repeat(1000) }))
   const pending = h.interactions.answerApproval({ agent, toolName: 'bash', callId: 'call_3', reason: 'r'.repeat(3000) }, NEVER)
   await waitFor(() => h.posts().length === 1)
   const blocks = h.posts()[0].options.blocks

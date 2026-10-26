@@ -288,6 +288,56 @@ install の最後の 10 行と、start --cutover・status の出力を返信し�
 2. Mac の `~/.dsh/cordis.patch.yml` の slack-channel 行の `disabled:` を元の式
    `!!js "ctx.get('profileContext') !== undefined && ctx.get('profileContext').name !== 'desktop'"` に戻す（HMR で再接続）
 
+## 更新: 承認プロンプトにコマンドを出す（2026-10-26。VM に入れるのは owner の OK を取ってから）
+
+VM の DSH は bash のコマンドを Landlock のサンドボックスで動かし、外で動かしたいときは Slack に承認プロンプト
+（`Approval required — bash`）を出す。DSH の承認リクエストにはツール名・呼び出し id・モデルが書いた理由しか入っていないので、
+これまでのプロンプトには理由しか出ず、10-26 に owner はどのコマンドかを見ないまま Allow once を 3 回押した。
+ブランチ `approval-command` の変更で、プロンプトに実行されるコマンドがコードブロックで出る:
+
+- チャンネルが `tools/pre-execute` で各呼び出しの引数を覚え（エージェントごとに直近 32 件）、承認リクエストの呼び出し id で引く。
+  bash ならコマンド（と `workdir`）、ほかのツールなら引数の JSON（`description` / `justification` は除く）。
+- `&` `<` `>` はほかの文字列と同じエスケープ（Slack はコードの中でも元の文字に戻して見せる）。コマンドの中の ```` ``` ```` は
+  ブロックを閉じないよう崩す。表示は 2000 文字（エスケープ後）まで。切ったときは本当の長さを添える。
+- 秘密らしい値は Slack に出す前に伏せる（`src/redact.js`。`ghp_` `xoxb-` `nvapi-` `sk-` などの形、`*TOKEN*=` `--password`
+  `Authorization:` の値、URL の `user:password@`、PEM の秘密鍵）。`$GH_TOKEN` のような参照はそのまま見せる。理由の行にも同じものをかける。
+- 決まったあとのメッセージ（✅ Allowed once など）にもコマンドを残す。チャンネルが見ていない呼び出し（再読み込みの直前に出たもの
+  など）は「コマンドを表示できない」と出る。
+
+確認済み: 単体テスト 186/186。コンテナ試験（103/103）で、偽のモデルが `GH_TOKEN=<鍵> sh -c '…' 2>&1 < /dev/null` を
+`sandbox_permissions: danger-full-access` で呼び、プロンプトにエスケープ済み・鍵を伏せたコマンドが出ること、Slack へ送った
+どの呼び出しにも鍵が無いこと、Allow のクリックで実行されて、決まったあとのメッセージにもコマンドが残ることを見た（下の「コンテナでの確認」）。
+未確認: 本物の Slack での見た目（コードブロック内の `&lt;` が `<` に見えるか）は、VM に入れたあとの最初の承認プロンプトで見る。
+
+### Mac: master に入れて push する（owner の OK の後）
+
+Mac の `~/work/dsh-slack-channel` では `src/` を書き換えない（Mac の DSH の dsh-hmr が見ている）。push はワークツリーから:
+
+```sh
+cd ~/work/dsh-slack-channel && git push origin approval-command:master
+```
+
+（master が `approval-command` の親のままなら早送りで入る。Mac のチェックアウトの master は古いままになるので、あとで
+DSH の Slack チャンネルが無効のまま・動いていないときに `git merge --ff-only origin/master`。）
+
+### 依頼文 4（更新して再起動）
+
+```text
+<@U0CCCH69XMW> DSH ボットの更新をお願いします。DSH が Slack に出す承認プロンプト（Approval required — bash）に、実際に実行されるコマンドがコードブロックで出るようになります（トークンらしい値は伏せ字になります）。再起動すると、動いている DSH のターンは中断されて再起動後にキューへ戻り、承認待ちのプロンプトがあれば取り消されます。
+
+1. 更新（いつものプロキシの入ったシェルで）
+   cd ~/dsh-slack-channel && git pull --ff-only && git log --oneline -1
+2. 再起動して状態を見る
+   ~/dsh-slack-channel/deploy/linux/setup.sh restart
+   ~/dsh-slack-channel/deploy/linux/setup.sh status
+
+返信してほしいもの: git log の 1 行 / restart と status の出力（status に socket connected が出ているか）。
+```
+
+`git log` の 1 行が push したコミットで始まり、`status` に `socket connected` が出れば入っている。そのあと DSH が承認プロンプトを
+出したら、`*Command*` の下にコードブロックでコマンドが出ているかを Slack で見る。戻すときは、ワークツリーでこのコミットを
+`git revert` して master に push し、同じ依頼文をもう一度送る（VM の作業ツリーを手で別のコミットにしない。次の `git pull --ff-only` が通らなくなる）。
+
 ## VM のファイル
 
 | パス | 中身 |
@@ -310,6 +360,6 @@ install の最後の 10 行と、start --cutover・status の出力を返信し�
 
 `deploy/linux/test/run.sh` が、VM に似せた Ubuntu 24.04（x86_64、systemd、root で `HOME=/home/hatch`、外へは HTTP プロキシ経由だけ、
 直接の :443 は平文の箱に当たる）で、clone → install → keygen → seal/import → check → `start --cutover` → 偽の Slack のメンションに
-bash ツールと web_search を使って返答 → restart → `start-saved`（サービスが消えた VM をプロキシ無し・有りのシェルから戻す、
+サンドボックスの外で動かす bash の承認プロンプト（コマンドが出て鍵が伏せてあるか見て、Allow をクリック）、bash ツール、web_search を使って返答 → restart → `start-saved`（サービスが消えた VM をプロキシ無し・有りのシェルから戻す、
 env ファイルのプロキシが 407 を返す、ソケットが失敗し続ける）→ stop を通す。bash ツールのサンドボックスは bubblewrap（OrbStack のカーネルには Landlock が
 無い）。最初の `check` だけ `bwrap` を隠して、`check` がサンドボックスの無いホストを `✗` にすることも見る。Slack・モデル API・GitHub MCP はすべて偽物（`fake-world.mjs`）。
