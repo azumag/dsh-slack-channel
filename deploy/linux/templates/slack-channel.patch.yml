@@ -42,8 +42,8 @@
         ackReaction: hourglass
         # One Slack thread = one session.
         sessionScope: thread
-        # At most one Slack turn at a time across all threads (the owner's choice, 2026-10-23).
-        maxConcurrentTurns: 1
+        # At most three Slack turns at a time across all threads (owner decision 2026-10-27; it was one since 2026-10-23).
+        maxConcurrentTurns: 3
         mentionOnly: true
         # Bot loop brakes (2026-10-21 DSH ↔ Claude loop).
         mentionBackBots: false
