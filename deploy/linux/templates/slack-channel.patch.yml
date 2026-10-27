@@ -24,6 +24,15 @@
           - { provider: nvidia, model: z-ai/glm-5.3-flash }
           - { provider: nvidia, model: deepseek-ai/deepseek-v4.1-flash }
         permissionPreset: workspace-write
+        # Command approvals are answered by rule (src/command-policy.js), the owner's choice
+        # 2026-10-27 after DSH asked for every command ("no sandbox backend" on the VM): force
+        # pushes, pushes to main/master, PR merge/close, deletes on GitHub, sudo and rm -r outside
+        # ~/work and /tmp still get the Slack prompt; this kit's secrets and its setup.sh are
+        # refused; every other command is allowed once without asking.
+        autoAllowCommands: true
+        denyCommands:
+          - '\.dsh-slack/(secrets/|env\b|env\.local\b|home/\.env\b|check-home/)'
+          - 'dsh-slack-channel/deploy/linux/setup\.sh'
         agentPreset: standard
         allowAllChannels: true
         stateFile: @DSH_HOME@/slack-state.json

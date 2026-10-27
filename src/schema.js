@@ -1,4 +1,5 @@
 import { isAbsolute } from 'node:path'
+import { invalidPatterns } from './command-policy.js'
 
 // Config schema for dsh-slack-channel.
 //
@@ -54,6 +55,9 @@ const DEFAULTS = Object.freeze({
   contextMessages: 20,
   threadContextMessages: 30,
   interactiveTimeoutMs: 30 * 60 * 1000,
+  autoAllowCommands: false,
+  askCommands: [],
+  denyCommands: [],
 })
 
 /** Hard cap on the interactive-prompt deadline (24h), whatever the config asks. */
@@ -419,6 +423,26 @@ function validate(input) {
   if (cfg.interactiveTimeoutMs === undefined || cfg.interactiveTimeoutMs > INTERACTIVE_TIMEOUT_MAX) {
     issues.push({ message: 'interactiveTimeoutMs must be a number in [0, ' + INTERACTIVE_TIMEOUT_MAX + '] (0 waits forever)' })
     cfg.interactiveTimeoutMs = DEFAULTS.interactiveTimeoutMs
+  }
+
+  // Answer approvals for commands by rule instead of asking every time: a
+  // command matching denyCommands is rejected, one matching askCommands gets
+  // the Slack prompt, anything else is allowed once at once. The lists are
+  // regular expressions added to the built-in ones (src/command-policy.js).
+  // Off by default: every approval is a prompt.
+  cfg.autoAllowCommands = src.autoAllowCommands === undefined ? DEFAULTS.autoAllowCommands : src.autoAllowCommands === true
+  if (src.autoAllowCommands !== undefined && typeof src.autoAllowCommands !== 'boolean') {
+    issues.push({ message: 'autoAllowCommands must be true or false' })
+  }
+  for (const key of ['askCommands', 'denyCommands']) {
+    const list = src[key] ?? DEFAULTS[key]
+    if (!Array.isArray(list) || list.some((entry) => typeof entry !== 'string' || entry.length === 0)) {
+      issues.push({ message: key + ' must be an array of regular expressions (non-empty strings)' })
+      cfg[key] = []
+      continue
+    }
+    for (const bad of invalidPatterns(list)) issues.push({ message: key + ': invalid regular expression ' + bad })
+    cfg[key] = [...list]
   }
 
   // Optional channel→session persistence so restarts resume conversations,

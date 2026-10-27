@@ -14,6 +14,8 @@
 // question reports the timeout to the model.
 
 import { randomUUID } from 'node:crypto'
+import { homedir } from 'node:os'
+import { createCommandPolicy } from './command-policy.js'
 import { toSlackMrkdwn } from './format.js'
 import { redactSecrets } from './redact.js'
 
@@ -129,6 +131,10 @@ export function createInteractions({ config, logger, slack, sessions, authorized
   const byChannel = new Map()
   /** The configured deadline; 0 waits forever (only !stop ends a prompt). */
   const timeoutMs = config.interactiveTimeoutMs
+  /** Rules that answer command approvals without a prompt (autoAllowCommands), or undefined. */
+  const commandPolicy = config.autoAllowCommands === true
+    ? createCommandPolicy({ cwd: config.cwd, home: homedir(), denyCommands: config.denyCommands, askCommands: config.askCommands })
+    : undefined
 
   function errorText(error) {
     return error?.message ?? String(error)
@@ -189,6 +195,18 @@ export function createInteractions({ config, logger, slack, sessions, authorized
   function callArguments(request) {
     if (request.agent === null || typeof request.agent !== 'object' || typeof request.callId !== 'string') return undefined
     return calls.get(request.agent)?.get(request.callId)
+  }
+
+  /**
+   * The rule verdict for an approval of a command call: 'allow' / 'deny' are
+   * answered without a prompt, 'ask' (with the rule that matched) prompts.
+   * Undefined — prompt as usual — when the rules are off, the call was not
+   * seen, or the call is not a command.
+   */
+  function ruleVerdict(args) {
+    if (commandPolicy === undefined) return undefined
+    if (args === null || typeof args !== 'object' || typeof args.command !== 'string') return undefined
+    return commandPolicy(args.command)
   }
 
   function track(entry) {
@@ -344,13 +362,25 @@ export function createInteractions({ config, logger, slack, sessions, authorized
     // The service races the signal itself; this is the belt-and-braces case of
     // a request that was already withdrawn when it reached us.
     if (request.signal?.aborted === true) return 'cancelled'
+    const call = callArguments(request)
+    const verdict = ruleVerdict(call)
+    if (verdict !== undefined && verdict.decision !== 'ask') {
+      const shown = clip(redactSecrets(call.command).replace(/\s+/g, ' '), 300)
+      if (verdict.decision === 'allow') {
+        logger.info('approval allowed by rule (' + text(request.toolName) + ' in ' + (record.key ?? record.chatId) + '): ' + shown)
+        return 'allowed-once'
+      }
+      logger.info('approval denied by rule ' + verdict.pattern + ' (' + text(request.toolName) + ' in ' + (record.key ?? record.chatId) + '): ' + shown)
+      return 'rejected'
+    }
     const entry = newEntry({
       kind: 'approval',
       channel: record.chatId,
       scope: record.key ?? String(record.chatId),
       threadTs: threadOf(record),
       request,
-      call: callArguments(request),
+      call,
+      rule: verdict?.pattern,
     })
     track(entry)
     armDeadline(entry, () => conclude(entry, { outcome: 'unavailable', expired: true }))
@@ -592,6 +622,10 @@ export function createInteractions({ config, logger, slack, sessions, authorized
     const lines = [':lock: *Approval required* — ' + codeSpan(entry.request.toolName)]
     const reason = clip(redactSecrets(text(entry.request.reason ?? entry.request.displayReason)), REASON_MAX)
     if (reason.trim().length > 0) lines.push(escape(reason))
+    if (typeof entry.rule === 'string') {
+      const rule = escapeClip(entry.rule.replace(/`/g, "'"), 200)
+      lines.push('_Asked because the command matches the rule `' + rule.body + (rule.cut ? '…' : '') + '`; other commands are allowed without asking._')
+    }
     lines.push(approvalFooter())
     return clip(lines.join('\n\n'), SECTION_TEXT_MAX)
   }

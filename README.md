@@ -265,6 +265,8 @@ as a one-entry chain.
 | `contextMessages` | `20` | How many unseen messages a mention-driven turn carries as context (`0` disables the buffer, `200` is the cap). |
 | `threadContextMessages` | `30` | `sessionScope: thread` only: when a reply in an existing thread creates that thread's session (the thread predates the switch to thread scope, or follows `!new` or a restart), its first turn carries up to this many of the thread's earlier messages — see *Thread history backfill* (`0` disables, `200` is the cap). |
 | `interactiveTimeoutMs` | `1800000` (30 min) | How long a Slack approval/question prompt waits before it is settled without an answer (`0` waits until the turn is stopped, `86400000` is the cap). |
+| `autoAllowCommands` | `false` | Answer approvals of command calls by rule instead of prompting every time: a command matching a deny rule is rejected, one matching an ask rule gets the Slack prompt (naming the rule), anything else is allowed once without a prompt. See *Approvals by rule*. |
+| `askCommands` / `denyCommands` | `[]` | Regular expressions (case-insensitive, tested against the whole command) **added to** the built-in ask / deny rules of `src/command-policy.js`. |
 | `retryDelayMs` | `3000` | Backoff after Web API failures. |
 | `socketRetryDelayMs` | `2000` | Backoff between Socket Mode reconnects. |
 | `receivePollMs` | `5000` | How often the receive-off file is checked (handover). |
@@ -334,6 +336,14 @@ The prompt is escaped exactly like a reply, so the tool's reason cannot smuggle 
 
 DSH's approval request names the call only by id (`toolName`, `callId`, the model's `reason`), so the plugin remembers each call's arguments on `tools/pre-execute` (the latest 32 per channel agent) and shows the one the request names. The command is shown as written — `&`, `<`, `>` escaped, a ```` ``` ```` inside it broken so it cannot end the block — cut at 2000 rendered characters with a note saying how long it really is, and with secret-looking values masked before it reaches Slack (`src/redact.js`: known key shapes such as `xoxb-`, `ghp_`, `nvapi-`, `sk-`, JWTs; values of secret-named variables, JSON keys, flags and `Authorization` headers; `user:password@` in URLs; PEM private keys — best effort, references such as `$GH_TOKEN` stay readable). The settled message keeps the command, so the thread records what was allowed. A call the plugin did not see (one raised before a reload, say) is said so instead of left out.
 
+**Approvals by rule** (`autoAllowCommands: true`). An approval of a command call the plugin saw — a sandbox escalation of `bash`, typically — is decided by the command text before anything is posted:
+
+- **deny** — rejected at once, logged (`approval denied by rule …`): `systemctl stop|disable|mask|kill|restart…`, `shutdown`/`reboot`/`poweroff`/`halt`, `mkfs`, plus `denyCommands`;
+- **ask** — the usual prompt, with a line naming the rule: force pushes (`--force`, `-f`, `--force-with-lease`, `--mirror`, `--delete`, `:branch`), pushes to `main`/`master`, `gh pr merge|close`, `gh repo|release delete`, `gh api -X DELETE`, `sudo`, a recursive `rm` of a path outside `cwd` and `/tmp` (an absolute path, `~`, `$HOME`, `..`, a bare `*`), plus `askCommands`;
+- **allow** — allowed once at once, logged (`approval allowed by rule …` with the command, secrets masked); nothing is posted.
+
+A call the plugin did not see and any tool without a `command` argument still get the prompt. The rules are a guard rail for an agent that means well, not a sandbox: `bash -c`, scripts and aliases can hide a command from any text match. Turning this on means whoever can mention the bot can run anything outside those rules.
+
 **Nothing waits forever.** A prompt that nobody answers is settled at `interactiveTimeoutMs` (30 minutes by default): an approval fails closed (`unavailable` — the operation is *not* approved), a question returns a timeout error to the model, and either way the turn finishes and the channel takes work again. Set a smaller value to fail fast in unattended channels, or `0` to wait until you `!stop` the turn.
 
 Other answerers in the composition are not bypassed: the prompt is also offered downstream (the DSH web UI, for example), whichever answers first wins, and a downstream answerer that declines to answer — no UI attached, or the session is not open there — leaves the channel in charge. A request from an agent this plugin does not own (a web session, another integration's agent) is delegated untouched; a *subagent* of a channel session is prompted in the channel it was delegated from, so a delegated approval cannot wedge the parent turn.
@@ -398,6 +408,7 @@ src/socket.js           Socket Mode loop: fresh-URL reconnect, envelope acks, ev
 src/handover.js         receive-off and drain files (moving the bot to another host without stopping its turns)
 src/interactions.js     Slack-side answering for approval/request and user-questions/request (buttons, deadline, the call's command)
 src/redact.js           masking of secret-looking values in what an approval prompt shows
+src/command-policy.js   the deny / ask / allow rules of autoAllowCommands
 src/format.js           markdown → Slack mrkdwn (escaped angle brackets, allowlisted mentions restored, fences preserved)
 src/message.js          frozen user-message factory (dsh-llm createUserMessage shape)
 src/collector.js        per-turn reply collector (last/all)

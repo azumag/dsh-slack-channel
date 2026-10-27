@@ -44,7 +44,8 @@ async function slackApi(req, res, method) {
   const blocks = Array.isArray(p.blocks) ? p.blocks : []
   const approvalCall = blocks.find((block) => block?.block_id === 'dsh-approval-call')?.text?.text
   const allow = blocks.flatMap((block) => block?.elements ?? []).find((element) => element?.action_id === 'dsh-slack-allow')
-  log({ host: 'slack.com', method, tokenMatches: token === tokens.bot ? 'bot' : token === tokens.app ? 'app' : 'no', channel: p.channel, thread_ts: p.thread_ts, text: p.markdown_text ?? p.text, name: p.name, approvalCall, approve: allow !== undefined || undefined })
+  const approvalHead = allow === undefined ? undefined : blocks.find((block) => block?.type === 'section')?.text?.text
+  log({ host: 'slack.com', method, tokenMatches: token === tokens.bot ? 'bot' : token === tokens.app ? 'app' : 'no', channel: p.channel, thread_ts: p.thread_ts, text: p.markdown_text ?? p.text, name: p.name, approvalHead, approvalCall, approve: allow !== undefined || undefined })
   const known = token === tokens.bot || token === tokens.app
   if (!known) return json(res, { ok: false, error: 'invalid_auth' })
   if (method === 'chat.postMessage' && allow !== undefined) setTimeout(() => clickAllow(p.channel, allow.value), 1500)
@@ -64,9 +65,17 @@ async function slackApi(req, res, method) {
 const textOf = (content) => typeof content === 'string' ? content
   : Array.isArray(content) ? content.map((c) => c.type === 'tool_result' ? textOf(c.content) : c.text ?? '').join(' ') : ''
 const STEPS = [
-  // Outside the sandbox, so DSH asks for approval; the prompt must show this command with the key masked.
+  // Outside the sandbox, an ordinary command: the kit's rules (autoAllowCommands) allow it without a prompt.
+  { ask: /escalate/i, name: 'bash', marker: 'auto-ok', input: {
+    command: "echo auto-ok-$((6*7))",
+    description: 'container auto-allow test',
+    sandbox_permissions: 'danger-full-access',
+    justification: 'container test: an ordinary command must run without a prompt',
+  } },
+  // Outside the sandbox and matching an ask rule (rm -r outside ~/work and /tmp), so DSH asks for
+  // approval; the prompt must show this command with the key masked.
   { ask: /escalate/i, name: 'bash', marker: 'approval-ok', input: {
-    command: 'GH_TOKEN=' + tokens.approvalSecret + " sh -c 'echo approval-ok-$((6*7))' 2>&1 < /dev/null",
+    command: 'GH_TOKEN=' + tokens.approvalSecret + " sh -c 'echo approval-ok-$((6*7))' 2>&1 < /dev/null; rm -rf /nonexistent-dsh-e2e",
     description: 'container approval test',
     sandbox_permissions: 'danger-full-access',
     justification: 'container test: the approval prompt must show this command',

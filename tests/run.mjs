@@ -5,6 +5,7 @@ import { summary } from './_util.mjs'
 
 for (const file of [
   'schema.spec.mjs',
+  'command-policy.spec.mjs',
   'format.spec.mjs',
   'collector.spec.mjs',
   'slack.spec.mjs',

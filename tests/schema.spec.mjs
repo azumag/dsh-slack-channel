@@ -264,3 +264,21 @@ test('fallbackCooldownMs defaults to 0 and takes non-negative milliseconds', () 
   assert(validate({ fallbackCooldownMs: -1 }).issues !== undefined, 'negative is rejected')
   assert(validate({ fallbackCooldownMs: '2m' }).issues !== undefined, 'a string is rejected')
 })
+
+test('autoAllowCommands and the rule lists: defaults, values and nonsense', () => {
+  const plain = validate({})
+  equal(plain.value.autoAllowCommands, false, 'off by default')
+  equal(plain.value.askCommands, [])
+  equal(plain.value.denyCommands, [])
+
+  const on = validate({ autoAllowCommands: true, denyCommands: ['\\.dsh-slack/secrets/'], askCommands: ['\\bnpm\\s+publish\\b'] })
+  assert(on.issues === undefined, 'valid rules pass: ' + JSON.stringify(on.issues))
+  equal(on.value.autoAllowCommands, true)
+  equal(on.value.denyCommands, ['\\.dsh-slack/secrets/'])
+
+  const bad = validate({ autoAllowCommands: 'yes', askCommands: ['('], denyCommands: 'x' })
+  const messages = (bad.issues ?? []).map((issue) => issue.message).join(' | ')
+  assert(messages.includes('autoAllowCommands must be true or false'), messages)
+  assert(messages.includes('askCommands: invalid regular expression'), messages)
+  assert(messages.includes('denyCommands must be an array'), messages)
+})

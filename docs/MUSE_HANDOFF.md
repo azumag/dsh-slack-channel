@@ -392,6 +392,53 @@ BUSY（終了コード 1）、承認待ち → BUSY、承認後に終わった �
 返信してほしいもの: 1. の git log の 1 行 / 2. の EDITED か STOP の行 / 3. の IDLE か BUSY の行 / restart と status の出力（status に socket connected が出ているか）。
 ```
 
+## 更新: コマンドの承認を規則で答える（2026-10-27、owner の決定）
+
+VM の DSH は、bash のコマンドを 1 つ実行するたびに「escalate sandbox to danger-full-access: ホストにサンドボックスバックエンドがなく…」
+と承認を求めていた（10-25 から。10-27 14:14・14:31 も #2826 のスレッドで同じ）。承認が出るたびに DSH の唯一のターン枠が
+止まり、ほかのスレッドも待つ。サンドボックスが VM で本当に使えないのかは未確認（10-25 の `check` は Landlock ✓ だった）。
+
+owner の選択（「危険なものだけ聞く」）: Cursor ボットと同じ考え方で、チャンネルが承認を規則で答える（`autoAllowCommands`、
+`src/command-policy.js`）。
+
+- 聞く（今までどおり Slack の承認プロンプト。どの規則で聞いたかを 1 行添える）: 強制 push、main/master への push、
+  `gh pr merge|close`、GitHub での削除（`gh repo|release delete`、`gh api -X DELETE`）、`sudo`、~/work と /tmp の外の `rm -r`
+- 拒否（プロンプトなし）: マシンを止める・再起動するコマンド、このキットの秘密（`~/.dsh-slack/secrets/`・`env`・`env.local`・
+  `home/.env`・`check-home/`）と `setup.sh`
+- それ以外: プロンプトなしで 1 回許可し、`dsh.log` に `approval allowed by rule (bash in <スレッド>): <コマンド>` と残す
+
+チャンネルが見ていない呼び出しや、command の無いツールの承認は、今までどおりプロンプトになる。
+
+確認済み（Mac、2026-10-27）: 単体試験 197/197。VM に似せたコンテナ（`deploy/linux/test/run.sh`）は 107 PASS / 0 FAIL — サンドボックスの外で
+動く普通のコマンドはプロンプトなしで動き（dsh.log に `approval allowed by rule`）、`rm -r` を含むコマンドはプロンプト（規則の 1 行つき、
+キーは伏せ字）で聞かれ、Allow で動いた。依頼文 6 の 2. の差し込みは、Ubuntu 24.04 で古いテンプレートの形のファイルに当てると、
+新しいテンプレートとバイト単位で一致した（mode 600、バックアップ = 元、2 回目は SKIP、pull 前は STOP、1 文字変えたコマンドは
+STOP で何も動かない）。
+未確認: 本物の DSH が VM で新しい設定で上がるか（4. の status で見る）、実際のスレッドで承認が出なくなるか（Slack で見る）。
+
+VM で動いているのは `install` が残した `~/.dsh-slack/slack-channel.patch.yml` なので、2. で更新後のテンプレートから
+`permissionPreset` と `agentPreset` の間の行（9 行）を写して差し込む。戻すとき:
+`cp -p ~/.dsh-slack/slack-channel.patch.yml.bak-before-autoallow-<日時> ~/.dsh-slack/slack-channel.patch.yml` → `setup.sh restart`
+（または差し込んだ `autoAllowCommands: true` を `false` にして restart）。
+
+### 依頼文 6（コードの更新 + 承認を規則で答える設定 + 再起動）
+
+```text
+DSH ボットの更新をお願いします。DSH がコマンドのたびに Slack で承認を求めていたのを、危険なもの（強制 push、main への push、PR の merge・close、GitHub での削除、sudo、~/work と /tmp の外の rm -r）だけ聞くようにします。コードを更新し、設定（~/.dsh-slack/slack-channel.patch.yml）に数行を足して、最後に 1 回だけ再起動します。再起動すると動いている DSH のターンが中断されるので、先に動いていないことを確かめます。2. と 3. の長い行はそのまま貼ってください（長さと sha256 を確かめてから動き、合わなければ STOP と出て何もしません）。
+
+1. コードの更新（いつものプロキシの入ったシェルで）
+   cd ~/dsh-slack-channel && git pull --ff-only && git log --oneline -1
+2. 設定に規則の行を足す（元のファイルは .bak-before-autoallow-<日時> に残ります。STOP と出たら 3. 以降に進まずに返信してください。SKIP なら足し済みなので 3. へ）
+   C='F=$HOME/.dsh-slack/slack-channel.patch.yml; T=$HOME/dsh-slack-channel/deploy/linux/templates/slack-channel.patch.yml; P="^        permissionPreset: workspace-write\$"; if grep -q autoAllowCommands "$F"; then echo "SKIP: $F already has autoAllowCommands; nothing changed"; elif [ "$(grep -c "$P" "$F")" != 1 ] || ! grep -q autoAllowCommands "$T"; then echo "STOP: expected one permissionPreset line in $F and autoAllowCommands in the template (git pull first); nothing changed"; else sed -n "/$P/,/^        agentPreset:/p" "$T" | sed "1d;\$d" > "$F.blk"; n=$(wc -l < "$F.blk"); B="$F.bak-before-autoallow-$(date +%Y%m%d-%H%M%S)"; cp -p "$F" "$B" && sed "/$P/r $F.blk" "$F" > "$F.new" && [ "$n" -ge 3 ] && [ "$(grep -c autoAllowCommands "$F.new")" = 1 ] && [ "$(diff "$F" "$F.new" | grep -c "^>")" = "$n" ] && [ "$(diff "$F" "$F.new" | grep -c "^<")" = 0 ] && chmod 600 "$F.new" && mv "$F.new" "$F" && echo "EDITED: added $n lines after permissionPreset; backup $B" || { rm -f "$F.new"; echo "STOP: the edit did not come out as expected; $F is unchanged (backup $B)"; }; rm -f "$F.blk"; fi'; if [ ${#C} = 1087 ] && [ "$(printf %s "$C" | sha256sum | cut -c1-16)" = a2a1071033a87bb8 ]; then eval "$C"; else echo "STOP: the command was changed in copying (length ${#C}); nothing ran"; fi
+3. DSH のターンが動いていないか確かめる（IDLE なら 4. へ。BUSY なら 5 分待ってもう一度。30 分たっても BUSY なら、再起動せずにここまでの出力を返信してください）
+   N=$(grep -m1 ^DSK_NODE= ~/.dsh-slack/env | cut -d= -f2-); J='const fs=require("fs"),p=require("path"),z=require("zlib"),root=process.env.HOME+"/.dsh-slack/home/sessions",win=40*60e3;let busy=0,seen=0;const ls=(d)=>{try{return fs.readdirSync(d)}catch{return []}};for(const d of ls(root))for(const s of ls(p.join(root,d))){const f=p.join(root,d,s,"session.v4.jsonl.zstd");let st;try{st=fs.statSync(f)}catch{continue}if(Date.now()-st.mtimeMs>win)continue;seen++;let a=0,b=0,q=0;for(const l of z.zstdDecompressSync(fs.readFileSync(f),{finishFlush:z.constants.ZSTD_e_flush}).toString().split("\n")){let t;try{t=JSON.parse(l).type}catch{continue}if(t==="turn/start")a++;if(t==="turn/end")b++;if(t==="approval/asked")q++;if(t==="approval/decided")q--}if(a>b||q>0){busy++;console.log("RUNNING "+s+" turns "+a+"/"+b+" prompts "+q+" last write "+new Date(st.mtimeMs).toISOString())}}console.log(busy?"BUSY: "+busy+" session(s) mid-turn - do not restart yet":"IDLE: no turn running ("+seen+" session(s) written in the last 40 min)");process.exit(busy?1:0)'; if [ ${#J} = 983 ] && [ "$(printf %s "$J" | sha256sum | cut -c1-16)" = 1ae11de4111b2b5d ]; then "${N:-$HOME/.dsh-slack/node/bin/node}" -e "$J"; else echo "STOP: the command was changed in copying (length ${#J}); nothing ran"; fi
+4. 再起動して、1 分ほど待ってから状態を見る
+   ~/dsh-slack-channel/deploy/linux/setup.sh restart
+   sleep 60; ~/dsh-slack-channel/deploy/linux/setup.sh status
+
+返信してほしいもの: 1. の git log の 1 行 / 2. の EDITED・SKIP・STOP の行 / 3. の IDLE か BUSY の行 / restart と status の出力（status に socket connected と own identity resolved が出ているか）。
+```
+
 ## VM のファイル
 
 | パス | 中身 |

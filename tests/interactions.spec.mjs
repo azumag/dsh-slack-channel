@@ -16,10 +16,11 @@ import { blockKitViolation } from './_util.mjs'
 const NEVER = () => new Promise(() => {})
 
 /** A manager wired to recording fakes. */
-function mount({ interactiveTimeoutMs = 5000, threadReplies = true, authorized = () => true, postDelayMs = 0 } = {}) {
+function mount({ interactiveTimeoutMs = 5000, threadReplies = true, authorized = () => true, postDelayMs = 0, config = {} } = {}) {
   const calls = []
   const records = new Map()
   const logs = []
+  const infos = []
   const slack = {
     async postMessage(channel, text, options = {}) {
       if (postDelayMs > 0) await sleep(postDelayMs)
@@ -32,8 +33,8 @@ function mount({ interactiveTimeoutMs = 5000, threadReplies = true, authorized =
     },
   }
   const interactions = createInteractions({
-    config: { interactiveTimeoutMs, threadReplies },
-    logger: { info: () => {}, warn: (m) => logs.push(m), error: (m) => logs.push(m) },
+    config: { interactiveTimeoutMs, threadReplies, ...config },
+    logger: { info: (m) => infos.push(m), warn: (m) => logs.push(m), error: (m) => logs.push(m) },
     slack,
     sessions: { lookup: (id) => records.get(id) },
     authorized,
@@ -44,6 +45,7 @@ function mount({ interactiveTimeoutMs = 5000, threadReplies = true, authorized =
     records,
     calls,
     logs,
+    infos,
     posts: () => calls.filter((call) => call.method === 'chat.postMessage'),
     updates: () => calls.filter((call) => call.method === 'chat.update'),
   }
@@ -628,4 +630,67 @@ test('approval: other tools show their arguments as JSON; old calls are forgotte
   assert(callSectionText(h.posts()[2].options.blocks).includes('echo 39'), 'the newest is kept')
   h.interactions.answerFromText('C42', 'deny', '', 'U1')
   await newest
+})
+
+const RULES = { autoAllowCommands: true, cwd: '/home/hatch/work' }
+
+test('approval by rule: an ordinary command is allowed once without a prompt', async () => {
+  const h = mount({ config: RULES })
+  const { agent, record } = owned()
+  h.records.set(agent.session.id, record)
+  h.interactions.noteCall(bashCall(agent, 'r1', { command: 'gh auth status 2>&1 | head -20', sandbox_permissions: 'danger-full-access' }))
+  equal(await h.interactions.answerApproval({ agent, toolName: 'bash', callId: 'r1', reason: 'escalate sandbox to danger-full-access: check gh' }, NEVER), 'allowed-once')
+  equal(h.posts().length, 0, 'nothing is posted')
+  assert(h.infos.some((line) => line.startsWith('approval allowed by rule (bash in C42): gh auth status')), 'the log names the command: ' + h.infos.join(' | '))
+  equal(h.interactions.hasPending('C42'), false, 'no prompt is left behind')
+})
+
+test('approval by rule: a hard-to-undo command gets the prompt, naming the rule', async () => {
+  const h = mount({ config: RULES })
+  const { agent, record } = owned()
+  h.records.set(agent.session.id, record)
+  h.interactions.noteCall(bashCall(agent, 'r2', { command: 'gh pr merge 2830 --squash' }))
+  const pending = h.interactions.answerApproval({ agent, toolName: 'bash', callId: 'r2', reason: 'merge' }, NEVER)
+  await waitFor(() => h.posts().length === 1)
+  const blocks = h.posts()[0].options.blocks
+  assert(blocks[0].text.text.includes('Asked because the command matches the rule'), 'the prompt says why it asks: ' + blocks[0].text.text)
+  assert(callSectionText(blocks).includes('gh pr merge 2830 --squash'), 'the command is shown')
+  equal(blockKitViolation(blocks), undefined, 'Slack would accept the prompt')
+  await h.interactions.handleInteractive(click('C42', ACTION_APPROVAL_ALLOW, button(blocks, ACTION_APPROVAL_ALLOW).value))
+  equal(await pending, 'allowed-once', 'a person still decides')
+})
+
+test('approval by rule: a denied command is rejected without a prompt', async () => {
+  const h = mount({ config: { ...RULES, denyCommands: ['\\.dsh-slack/secrets/'] } })
+  const { agent, record } = owned()
+  h.records.set(agent.session.id, record)
+  h.interactions.noteCall(bashCall(agent, 'r3', { command: 'cat ~/.dsh-slack/secrets/slack.json' }))
+  equal(await h.interactions.answerApproval({ agent, toolName: 'bash', callId: 'r3' }, NEVER), 'rejected')
+  equal(h.posts().length, 0, 'nothing is posted')
+  assert(h.infos.some((line) => line.startsWith('approval denied by rule')), 'the denial is logged')
+})
+
+test('approval by rule: unseen calls, other tools and rules off still prompt', async () => {
+  const h = mount({ config: RULES })
+  const { agent, record } = owned()
+  h.records.set(agent.session.id, record)
+  const unseen = h.interactions.answerApproval({ agent, toolName: 'bash', callId: 'never-seen' }, NEVER)
+  await waitFor(() => h.posts().length === 1)
+  h.interactions.answerFromText('C42', 'deny', '', 'U1')
+  equal(await unseen, 'rejected', 'a call the channel did not see is asked about')
+  h.interactions.noteCall({ agent, callId: 'w2', name: 'write', arguments: { path: '/etc/hosts', content: 'x' } })
+  const write = h.interactions.answerApproval({ agent, toolName: 'write', callId: 'w2' }, NEVER)
+  await waitFor(() => h.posts().length === 2)
+  h.interactions.answerFromText('C42', 'deny', '', 'U1')
+  equal(await write, 'rejected', 'a call without a command is asked about')
+
+  const off = mount()
+  const o = owned()
+  off.records.set(o.agent.session.id, o.record)
+  off.interactions.noteCall(bashCall(o.agent, 'r4', { command: 'ls' }))
+  const plain = off.interactions.answerApproval({ agent: o.agent, toolName: 'bash', callId: 'r4' }, NEVER)
+  await waitFor(() => off.posts().length === 1)
+  assert(off.posts()[0].options.blocks[0].text.text.includes('Asked because') === false, 'without rules the prompt has no rule line')
+  off.interactions.answerFromText('C42', 'allow', '', 'U1')
+  equal(await plain, 'allowed-once', 'rules off: every approval is a prompt')
 })

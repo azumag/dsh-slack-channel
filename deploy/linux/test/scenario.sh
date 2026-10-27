@@ -243,12 +243,18 @@ grep -q 'own identity resolved' /tmp/start.log && pass "start --cutover shows th
 grep -q 'INFO \[slack-channel\]' $DSK/logs/dsh.log && pass "DSH log records reach dsh.log" || fail "no DSH log records in dsh.log"
 grep '"host":"integrate.api.nvidia.com"' $LOG | grep '"hasBash":true' | tail -n 2
 
+section "approvals by rule: an ordinary command outside the sandbox runs without a prompt"
+grep '"method":"chat.postMessage"' $LOG | grep '"approve":true' | grep -q 'auto-ok' && fail "the ordinary command got an approval prompt" || pass "no approval prompt for the ordinary command"
+grep -q 'approval allowed by rule (bash in .*): echo auto-ok' $DSK/logs/dsh.log && pass "dsh.log records the command allowed by rule" || fail "no 'approval allowed by rule' line for the ordinary command in dsh.log"
+case "$answered" in *'auto-ok-42'*) pass "the ordinary command ran outside the sandbox" ;; *) fail "the ordinary command's output is not in the answer" ;; esac
+
 section "the approval prompt shows the command it asks about (key masked), and the click allows it"
 prompt="$(grep '"method":"chat.postMessage"' $LOG | grep '"approve":true' | tail -n 1)"
 echo "approval prompt: $prompt"
 [ -n "$prompt" ] && pass "an approval prompt was posted in the mention's thread" || fail "no approval prompt was posted"
 case "$prompt" in *'"thread_ts":"'"$mention_ts"'"'*) pass "the prompt is in the mention's thread" ;; *) fail "the prompt is not in the mention's thread" ;; esac
-shown="GH_TOKEN=ghp_&lt;redacted&gt; sh -c 'echo approval-ok-\$((6*7))' 2&gt;&amp;1 &lt; /dev/null"
+printf '%s' "$prompt" | grep -qF 'Asked because the command matches the rule' && pass "the prompt names the rule that made it ask" || fail "the prompt does not say which rule made it ask"
+shown="GH_TOKEN=ghp_&lt;redacted&gt; sh -c 'echo approval-ok-\$((6*7))' 2&gt;&amp;1 &lt; /dev/null; rm -rf /nonexistent-dsh-e2e"
 printf '%s' "$prompt" | grep -qF "$shown" && pass "the prompt shows the command, escaped, the key masked" || fail "the prompt does not show the command as expected: $shown"
 printf '%s' "$prompt" | grep -qF '"approvalCall":"*Command*\n```\n' && pass "the command is a code block" || fail "the command is not a code block"
 grep -qF "$APPROVAL_SECRET" $LOG && fail "the inline key reached Slack" || pass "the inline key reached no Slack call"
