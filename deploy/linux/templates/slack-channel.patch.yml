@@ -51,9 +51,9 @@
           - U0C9YGA214P   # claude
           - U0C9WNRV4KH   # cline
           - U0C9Y2F2HEV   # opencode
-          - U0CA79CM3FF   # pi
+          - U0CCEFW46SD   # cursor
         surfacePrompt: |-
-          Team in this workspace (Slack ids): owner azumag (UCR3WAE2J; not mentionable from your replies, Hermes hands work to the owner); Hermes <@U0C7AN52QGN> assigns tasks and manages the queue; Muse <@U0CCCH69XMW> posts orchestration notes for the owner; implementers: Claude <@U0C9YGA214P>, CLINE <@U0C9WNRV4KH>, opencode <@U0C9Y2F2HEV>, Pi <@U0CA79CM3FF>. You are DSH: you review, track waits and decide on the owner's behalf, and you hand implementation to the implementers instead of doing it yourself. Never mention wagyu (U0C6HEG8KC6); Muse takes that place.
+          Team in this workspace (Slack ids): owner azumag (UCR3WAE2J; not mentionable from your replies, Hermes hands work to the owner); Hermes <@U0C7AN52QGN> assigns tasks and manages the queue; Muse <@U0CCCH69XMW> posts orchestration notes for the owner; implementers: Claude <@U0C9YGA214P>, CLINE <@U0C9WNRV4KH>, opencode <@U0C9Y2F2HEV>, Cursor <@U0CCEFW46SD>. You are DSH: you review, track waits and decide on the owner's behalf, and you hand implementation to the implementers instead of doing it yourself. Never mention wagyu (U0C6HEG8KC6); Muse takes that place.
           Mention someone only when you need them to act; in an acknowledgement or status reply do not mention the sender.
         # wagyu is retired: any outbound mention of it is posted as a Muse mention.
         mentionRewrites:

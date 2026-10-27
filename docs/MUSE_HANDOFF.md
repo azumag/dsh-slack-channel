@@ -341,6 +341,57 @@ DSH の Slack チャンネルが無効のまま・動いていないときに `g
 出したら、`*Command*` の下にコードブロックでコマンドが出ているかを Slack で見る。戻すときは、ワークツリーでこのコミットを
 `git revert` して master に push し、同じ依頼文をもう一度送る（VM の作業ツリーを手で別のコミットにしない。次の `git pull --ff-only` が通らなくなる）。
 
+## 更新: Pi をチームから外して Cursor を入れる（2026-10-27、owner の決定）
+
+owner: 「Pi はチームから外す。各ボットの名簿と受け付けリストの Pi を Cursor に置き換えて。Pi のボット自体はまだ止めない。」
+Cursor は Muse の VM の新しいボット（`cursor`、U0CCEFW46SD、実装担当）。DSH では次の 2 か所が Pi だった:
+
+- `mentionUserIds`（DSH が本文で本当にメンションしてよい相手）の `- U0CA79CM3FF   # pi`
+- `surfacePrompt` の名簿の implementers の `Pi <@U0CA79CM3FF>`
+
+テンプレート（`deploy/linux/templates/slack-channel.patch.yml`）は直した。VM で動いているのはテンプレートから書き出した
+`~/.dsh-slack/slack-channel.patch.yml`（`install` は既にあるファイルを残す）なので、依頼文 5 でその 2 か所だけを置き換える。
+
+**受け付けについて:** DSH には送り手を絞る設定が無い。許可されたチャンネル（VM は `allowAllChannels: true`）で DSH に
+メンションすれば、人でもどのボットでもターンが始まる（ボット同士の往復は `maxBotTurns` / `maxBotRepeats` で止まるだけ）。
+置き換える「受け付けリスト」が無いので、Cursor はもう受け付けられていて、Pi のメンションもまだ DSH のターンを始める。
+止めるには送り手を無視する設定をコードに足す必要がある（owner の判断で今は足さない、2026-10-27）。
+
+依頼文 5 は依頼文 4（コードの更新）を含む。依頼文 4 を送った後でも害はない（`git pull` が Already up to date になるだけ）。
+2. と 3. の長い行は、長さと sha256 の先頭 16 桁が合ったときだけ動く（10-27 に Muse が長い文字列を手で打ち直して壊したため）。
+2. は置き換える前に元のファイルを `.bak-before-cursor-<日時>` に写し、Pi の行が 2 つ・Cursor が 0 のときだけ、
+別ファイルに書いてから入れ替える（Pi 0・Cursor 2・差分 4 行を確かめる）。2 回目は STOP で何もしない。
+3. は直近 40 分に書かれたセッションログ（`~/.dsh-slack/home/sessions/*/*/session.v4.jsonl.zstd`）で、`turn/start` より
+`turn/end` が少ないもの、答えの出ていない `approval/asked` があるものを数える（キットの Node の zstd で読む。書きかけの
+最後のフレームは読み飛ばす）。
+
+確認済み（Mac、2026-10-27）: VM に似せたコンテナ（dshslack-test:base、GNU sed、Node v24.22.1）で 15/15 — 置き換え後の
+ファイルが新しいテンプレートを同じ手順で書き出したものとバイト単位で一致、mode 600、バックアップ = 元、2 回目は STOP、1 文字
+変えたコマンドは STOP で何も動かない。3. はセッション無し → IDLE、終わったターンと 2 時間前の中断 → IDLE、書きかけのターン →
+BUSY（終了コード 1）、承認待ち → BUSY、承認後に終わった → IDLE。Mac の実ログでも、書き込み中のデスクトップのターンを BUSY と出した。
+置き換え前後の YAML は ruby の YAML で読めた。未確認: VM の実ファイルが同じ形か（2. のガードが確かめる）、本物の DSH が新しい設定で上がるか（4. の status で見る）。
+
+戻すとき: `cp -p ~/.dsh-slack/slack-channel.patch.yml.bak-before-cursor-<日時> ~/.dsh-slack/slack-channel.patch.yml` →
+`setup.sh restart`。テンプレートの変更を master に入れないまま `install --reconfigure` すると Pi に戻る。
+
+### 依頼文 5（コードの更新 + Pi を Cursor に置き換え + 再起動）
+
+```text
+<@U0CCCH69XMW> DSH ボットの更新をお願いします。2 つあります。(a) 承認プロンプト（Approval required — bash）に、実際に実行されるコマンドがコードブロックで出るようになるコードの更新。(b) チームから Pi が外れて Cursor が入ったので、DSH の設定（~/.dsh-slack/slack-channel.patch.yml）の名簿と「メンションしてよい相手」の Pi を Cursor（U0CCEFW46SD）に置き換えます。最後に 1 回だけ再起動します。再起動すると動いている DSH のターンが中断されるので、先に動いていないことを確かめます。2. と 3. の長い行はそのまま貼ってください（長さと sha256 を確かめてから動き、合わなければ STOP と出て何もしません）。
+
+1. コードの更新（いつものプロキシの入ったシェルで。更新済みなら Already up to date と出ます）
+   cd ~/dsh-slack-channel && git pull --ff-only && git log --oneline -1
+2. 設定の Pi を Cursor に置き換える（元のファイルは .bak-before-cursor-<日時> に残ります。STOP と出たら 3. 以降に進まずに返信してください）
+   C='F=$HOME/.dsh-slack/slack-channel.patch.yml; p=$(grep -c U0CA79CM3FF "$F"); c=$(grep -c U0CCEFW46SD "$F"); if [ "$p" = 2 ] && [ "$c" = 0 ]; then B="$F.bak-before-cursor-$(date +%Y%m%d-%H%M%S)"; cp -p "$F" "$B" && sed -e "s/- U0CA79CM3FF   # pi$/- U0CCEFW46SD   # cursor/" -e "s/Pi <@U0CA79CM3FF>/Cursor <@U0CCEFW46SD>/" "$F" > "$F.new" && [ "$(grep -c U0CA79CM3FF "$F.new")" = 0 ] && [ "$(grep -c U0CCEFW46SD "$F.new")" = 2 ] && [ "$(diff "$F" "$F.new" | grep -c "^[<>]")" = 4 ] && chmod 600 "$F.new" && mv "$F.new" "$F" && echo "EDITED: Pi -> Cursor on 2 lines; backup $B" || { rm -f "$F.new"; echo "STOP: the edit did not come out as expected; $F is unchanged (backup $B)"; }; else echo "STOP: expected 2 Pi lines and 0 Cursor lines, found pi=$p cursor=$c; nothing changed"; fi'; if [ ${#C} = 778 ] && [ "$(printf %s "$C" | sha256sum | cut -c1-16)" = d19b54ddf2368560 ]; then eval "$C"; else echo "STOP: the command was changed in copying (length ${#C}); nothing ran"; fi
+3. DSH のターンが動いていないか確かめる（IDLE なら 4. へ。BUSY なら 5 分待ってもう一度。30 分たっても BUSY なら、再起動せずにここまでの出力を返信してください）
+   N=$(grep -m1 ^DSK_NODE= ~/.dsh-slack/env | cut -d= -f2-); J='const fs=require("fs"),p=require("path"),z=require("zlib"),root=process.env.HOME+"/.dsh-slack/home/sessions",win=40*60e3;let busy=0,seen=0;const ls=(d)=>{try{return fs.readdirSync(d)}catch{return []}};for(const d of ls(root))for(const s of ls(p.join(root,d))){const f=p.join(root,d,s,"session.v4.jsonl.zstd");let st;try{st=fs.statSync(f)}catch{continue}if(Date.now()-st.mtimeMs>win)continue;seen++;let a=0,b=0,q=0;for(const l of z.zstdDecompressSync(fs.readFileSync(f),{finishFlush:z.constants.ZSTD_e_flush}).toString().split("\n")){let t;try{t=JSON.parse(l).type}catch{continue}if(t==="turn/start")a++;if(t==="turn/end")b++;if(t==="approval/asked")q++;if(t==="approval/decided")q--}if(a>b||q>0){busy++;console.log("RUNNING "+s+" turns "+a+"/"+b+" prompts "+q+" last write "+new Date(st.mtimeMs).toISOString())}}console.log(busy?"BUSY: "+busy+" session(s) mid-turn - do not restart yet":"IDLE: no turn running ("+seen+" session(s) written in the last 40 min)");process.exit(busy?1:0)'; if [ ${#J} = 983 ] && [ "$(printf %s "$J" | sha256sum | cut -c1-16)" = 1ae11de4111b2b5d ]; then "${N:-$HOME/.dsh-slack/node/bin/node}" -e "$J"; else echo "STOP: the command was changed in copying (length ${#J}); nothing ran"; fi
+4. 再起動して、1 分ほど待ってから状態を見る
+   ~/dsh-slack-channel/deploy/linux/setup.sh restart
+   sleep 60; ~/dsh-slack-channel/deploy/linux/setup.sh status
+
+返信してほしいもの: 1. の git log の 1 行 / 2. の EDITED か STOP の行 / 3. の IDLE か BUSY の行 / restart と status の出力（status に socket connected が出ているか）。
+```
+
 ## VM のファイル
 
 | パス | 中身 |
